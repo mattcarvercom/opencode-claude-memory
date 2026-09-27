@@ -18,6 +18,18 @@ Claude Code writes memory → OpenCode reads it. OpenCode writes memory → Clau
 
 ---
 
+## About this fork
+
+This is a fork of [kuitos/opencode-claude-memory](https://github.com/kuitos/opencode-claude-memory) for folders that other tools also write to, such as [dsh-unified-memory](https://github.com/mattcarvercom/dsh-unified-memory) or Claude Code itself. Upstream rewrites a memory's whole file on every save, which drops any frontmatter it does not know, including other tools' provenance. This fork:
+
+- **Keeps what it does not own.** Saving an existing memory changes only its name, description, type, `modified` and body; every other frontmatter line, including another tool's `metadata.origin`, is kept byte for byte.
+- **Records provenance.** Files it creates carry `metadata.origin: opencode` and `metadata.modified`; edits to files another tool created add `metadata.updatedBy: opencode`.
+- **Keeps a copy of other tools' memories it deletes.** Deleting a memory it did not create (for example during auto-dream consolidation) first copies it to `$CLAUDE_CONFIG_DIR/opencode-memory/<project>/trash/<timestamp>/`.
+- **Writes atomically.** Memory files and `MEMORY.md` are written to a temporary file and renamed into place.
+- **Quotes YAML values that need it,** and reads quoted values back correctly.
+
+Everything else behaves as upstream does. The fork is not published to npm, so it is installed from a clone (see [Quick Start](#-quick-start)).
+
 ## ✨ At a glance
 
 - **Memory tools** — `memory_save` / `memory_delete` / `memory_list` / `memory_search` / `memory_read`, plus the Claude Code memory instructions injected into every system prompt.
@@ -29,16 +41,31 @@ Claude Code writes memory → OpenCode reads it. OpenCode writes memory → Clau
 
 ## 🚀 Quick Start
 
-Requires OpenCode **≥ 1.18**.
+Requires OpenCode **≥ 1.18**, [Bun](https://bun.sh) and git.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mattcarvercom/opencode-claude-memory/main/scripts/install.sh | bash
+```
+
+The script clones the fork into `~/.local/share/opencode-claude-memory` (`--dir` to change it), builds it, and points your global opencode config at the checkout with a `file://` plugin entry, replacing any `opencode-claude-memory` entry and keeping its options. Run it again to update. `--config FILE` edits another config file, and `--no-config` leaves configuration to you; when piping, pass options after `bash -s --`, as in `... | bash -s -- --no-config`. A config file with comments is edited only where the plugin's name appears; if there is none to replace, the script prints the line to add.
+
+To do the same by hand:
+
+```bash
+git clone https://github.com/mattcarvercom/opencode-claude-memory ~/.local/share/opencode-claude-memory
+cd ~/.local/share/opencode-claude-memory && bun install && bun run build
+```
 
 ```jsonc
 // opencode.json (project) or ~/.config/opencode/opencode.json (global)
 {
-  "plugin": ["opencode-claude-memory"]
+  "plugin": ["file:///home/you/.local/share/opencode-claude-memory"]
 }
 ```
 
-That's it. Start `opencode` and use it as usual. Memories live in `~/.claude/projects/<project>/memory/` (or under `$CLAUDE_CONFIG_DIR`), exactly where Claude Code keeps them.
+After pulling changes, run `bun install && bun run build` again (`dist/` is not committed), then restart opencode.
+
+Memories live in `~/.claude/projects/<project>/memory/` (or under `$CLAUDE_CONFIG_DIR`), exactly where Claude Code keeps them.
 
 ## ⚙️ How it works
 
@@ -135,6 +162,8 @@ npm uninstall -g opencode-claude-memory
 grep -n OPENCODE_MEMORY ~/.zshrc ~/.bashrc ~/.zshenv ~/.profile 2>/dev/null
 ```
 
+With this fork, step 3 is replaced by the [Quick Start](#-quick-start) install, which swaps the npm entry for the fork's `file://` entry.
+
 ```jsonc
 // 3. pin the major in opencode.json — OpenCode caches npm plugins per specifier,
 //    so a bare "opencode-claude-memory" keeps serving the v1 it installed earlier
@@ -170,7 +199,7 @@ bun run typecheck
 bun run build       # emits dist/
 ```
 
-Releases are cut by semantic-release on push to `main`.
+Upstream cuts releases with semantic-release on push to `main`; that workflow is disabled in this fork, which is not published to npm.
 
 ## 📄 License
 
