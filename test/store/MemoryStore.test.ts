@@ -446,9 +446,106 @@ describe("MemoryStore provenance (shared folders)", () => {
 
   test("deleting its own memory removes it without a copy", () => {
     const store = clockStore()
-    store.save({ fileName: "h", name: "H", description: "d", type: "user", content: "x" })
+    const { filePath } = store.save({ fileName: "h", name: "H", description: "d", type: "user", content: "x" })
+    // the store's clock is fixed, so give the file the modification time that clock implies
+    utimesSync(filePath, at, at)
     expect(store.delete("h")).toEqual({ deleted: true })
     expect(existsSync(join(store.stateDir, "trash"))).toBe(false)
+  })
+
+  test("deleting its own memory after another tool stamped an edit keeps a copy", () => {
+    const store = clockStore()
+    const filePath = join(store.memoryDir, "j.md")
+    writeFileSync(
+      filePath,
+      "---\nname: J\ndescription: d\nmetadata:\n  type: user\n  origin: opencode\n  modified: 2026-09-26T12:00:00.000Z\n  updatedBy: dsh\n---\n\nedited by dsh\n",
+    )
+    utimesSync(filePath, at, at)
+    expect(store.delete("j").trashedTo).toBeDefined()
+  })
+
+  test("deleting its own memory after an unstamped edit (Claude Code) keeps a copy", () => {
+    const store = clockStore()
+    const { filePath } = store.save({ fileName: "k", name: "K", description: "d", type: "user", content: "x" })
+    const edited = new Date(at.getTime() + 60 * 60 * 1000)
+    writeFileSync(filePath, readFileSync(filePath, "utf-8").replace("\nx\n", "\nedited by Claude Code\n"))
+    utimesSync(filePath, edited, edited)
+    const { trashedTo } = store.delete("k")
+    expect(trashedTo).toBeDefined()
+    expect(readFileSync(trashedTo as string, "utf-8")).toContain("edited by Claude Code")
+  })
+
+  test("its own memory without a readable modified stamp is treated as another tool's", () => {
+    const store = clockStore()
+    const filePath = join(store.memoryDir, "l.md")
+    writeFileSync(filePath, "---\nname: L\ndescription: d\nmetadata:\n  type: user\n  origin: opencode\n---\n\nx\n")
+    expect(store.delete("l").trashedTo).toBeDefined()
+  })
+
+  test("its own memory re-saved by this plugin still deletes without a copy", () => {
+    const store = clockStore()
+    store.save({ fileName: "m", name: "M", description: "d", type: "user", content: "one" })
+    const { filePath } = store.save({ fileName: "m", name: "M2", description: "d2", type: "feedback", content: "two" })
+    utimesSync(filePath, at, at)
+    expect(store.delete("m")).toEqual({ deleted: true })
+  })
+
+  // Claude Code's Write and Edit tools keep the existing metadata (origin included), add node_type
+  // and originSessionId, and restamp `modified` to the time of the edit.
+  test("deleting its own memory after Claude Code restamped an edit keeps a copy", () => {
+    const store = clockStore()
+    const edited = new Date(at.getTime() + 60 * 60 * 1000)
+    writeRawMemory(
+      store.memoryDir,
+      "n.md",
+      `---\nname: n\ndescription: d\nmetadata: \n  node_type: memory\n  type: user\n  origin: opencode\n  modified: ${edited.toISOString()}\n  originSessionId: 11111111-2222-4333-8444-555555555555\n---\n\nedited by Claude Code\n`,
+      edited,
+    )
+    const { trashedTo } = store.delete("n")
+    expect(trashedTo).toBeDefined()
+    expect(readFileSync(trashedTo as string, "utf-8")).toContain("edited by Claude Code")
+  })
+
+  test("a second modified line after the metadata block does not pass for its own stamp", () => {
+    const store = clockStore()
+    const edited = new Date(at.getTime() + 60 * 60 * 1000)
+    writeRawMemory(
+      store.memoryDir,
+      "o.md",
+      `---\nname: O\ndescription: d\nmetadata:\n  type: user\n  origin: opencode\n  modified: ${at.toISOString()}\nmodified: ${edited.toISOString()}\n---\n\nedited elsewhere\n`,
+      edited,
+    )
+    expect(store.delete("o").trashedTo).toBeDefined()
+  })
+
+  test("an updatedBy written as a list still counts as another tool's edit", () => {
+    const store = clockStore()
+    writeRawMemory(
+      store.memoryDir,
+      "p.md",
+      `---\nname: P\ndescription: d\nmetadata:\n  type: user\n  origin: opencode\n  modified: ${at.toISOString()}\n  updatedBy:\n    - dsh\n---\n\nedited by dsh\n`,
+      at,
+    )
+    expect(store.delete("p").trashedTo).toBeDefined()
+  })
+
+  test("a modified stamp well after the file's modification time keeps a copy", () => {
+    const store = clockStore()
+    const { filePath } = store.save({ fileName: "q", name: "Q", description: "d", type: "user", content: "x" })
+    // e.g. a date-only `modified: 2026-09-26` another writer left, read as midnight UTC
+    utimesSync(filePath, new Date(at.getTime() - 60 * 60 * 1000), new Date(at.getTime() - 60 * 60 * 1000))
+    expect(store.delete("q").trashedTo).toBeDefined()
+  })
+
+  test.skipIf(!canSymlink())("refuses to save a memory file that links to MEMORY.md", () => {
+    const store = clockStore()
+    const index = "# Index\n- [Keep](keep.md) — k\n"
+    writeFileSync(store.entrypoint, index)
+    symlinkSync(store.entrypoint, join(store.memoryDir, "alias.md"), "file")
+    expect(() =>
+      store.save({ fileName: "alias", name: "Alias", description: "a", type: "user", content: "alias body" }),
+    ).toThrow(/link to MEMORY\.md/)
+    expect(readFileSync(store.entrypoint, "utf-8")).toBe(index)
   })
 
   test("a type kept both at the top level and under metadata is updated in both places", () => {

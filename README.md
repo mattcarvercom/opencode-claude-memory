@@ -174,7 +174,7 @@ Stay on OpenCode 1? Use the `opencode-1` branch of this fork, or [upstream](http
 
 **Do I need to migrate existing memory?** No. Existing Claude Code memory files are used as they are.
 
-**Where is data stored?** `~/.claude/projects/<project>/memory/` (or `$CLAUDE_CONFIG_DIR/projects/...`). Plugin state lives in `$CLAUDE_CONFIG_DIR/opencode-memory/<project>/`. Memories the plugin deletes but did not create (Claude Code's, or another tool's) are copied to `trash/<timestamp>/` there first.
+**Where is data stored?** `~/.claude/projects/<project>/memory/` (or `$CLAUDE_CONFIG_DIR/projects/...`). Plugin state lives in `$CLAUDE_CONFIG_DIR/opencode-memory/<project>/`. Memories the plugin deletes that are not purely its own (Claude Code's, another tool's, or one of its own that another tool has since edited) are copied to `trash/<timestamp>/` there first.
 
 **Can I disable extraction, auto-dream or recall?** Yes - `extract.enabled`, `autodream.enabled`, `recall.enabled` in the plugin options.
 

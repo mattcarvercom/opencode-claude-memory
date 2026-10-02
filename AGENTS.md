@@ -123,7 +123,7 @@ bun run build            # dist/ via tsconfig.build.json
 ## Notes
 
 - Memory directory: `<CLAUDE_CONFIG_DIR>/projects/<sanitizePath(canonicalGitRoot)>/memory/`, shared with Claude Code. `sanitizePath` / `djb2Hash` are exact copies of Claude Code's.
-- Provenance: files this plugin creates carry `metadata.origin: opencode`; edits to other tools' files add `metadata.updatedBy: opencode` and keep every other frontmatter line. Deleting a memory it did not create first copies it to `<stateDir>/trash/<timestamp>/`.
+- Provenance: files this plugin creates carry `metadata.origin: opencode`; edits to other tools' files add `metadata.updatedBy: opencode` and keep every other frontmatter line. Deleting a memory that is not purely its own (another tool's, or its own once another tool has edited it: extra frontmatter keys, or an mtime more than 2 s from its `modified`) first copies it to `<stateDir>/trash/<timestamp>/`.
 - Plugin state: `<CLAUDE_CONFIG_DIR>/opencode-memory/<same key>/extraction-state.json` (+ `extraction-state.lock` around every update, + `maintenance.lock` shared by extraction and auto-dream across processes) plus `plugin.log`, `trash/` and `dream-backups/`. A v1 `<cksum>.consolidate-lock` is migrated once at start-up.
 - A plugin directory is loaded through its root `index.js` (OpenCode 2 resolves `<dir>/server` or `<dir>/index`, not `package.json`); a config path that points at a file is rejected. Config key is `plugins` (entries `"path"` or `{ package, options }`); the old `plugin` key is still read.
 - Design history of the plugin's own "v2" (the in-process rewrite, not OpenCode 2) lives in `docs/v2/`.

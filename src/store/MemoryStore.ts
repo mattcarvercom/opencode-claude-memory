@@ -1,10 +1,11 @@
-import { cpSync, mkdirSync, readFileSync, unlinkSync } from "node:fs"
+import { cpSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { writeFileAtomicSync } from "../util/exclusiveFile.js"
 import {
   buildFrontmatter,
   editFrontmatter,
   FRONTMATTER_MAX_LINES,
+  frontmatterKeys,
   type MemoryType,
   ORIGIN,
   type ParsedMemoryFile,
@@ -46,7 +47,7 @@ export type SaveMemoryResult = {
 
 export type DeleteMemoryResult = {
   deleted: boolean
-  // Where a copy was kept, when the memory was created by another tool.
+  // Where a copy was kept, when the memory was not purely this plugin's (see isPurelyOwn).
   trashedTo?: string
 }
 
@@ -119,6 +120,10 @@ export class MemoryStore {
     if (typeof input.name !== "string" || !input.name.trim()) {
       throw new Error("Memory name is required")
     }
+    // Writes follow links, so a memory file that links to the index would overwrite MEMORY.md itself.
+    if (isLinkTo(filePath, this.entrypoint)) {
+      throw new Error(`Memory "${relativePath}" is a link to ${ENTRYPOINT_NAME}; saving it would overwrite the index`)
+    }
 
     const existing = readTextFile(filePath)
     const parsed = existing === null ? null : parseFrontmatter(existing)
@@ -150,16 +155,17 @@ export class MemoryStore {
     return { filePath, fileName: relativePath, unchanged: false }
   }
 
-  // Deleting a memory this plugin did not create (Claude Code's, dsh's, a hand-written one) first
-  // keeps a copy under the plugin's state directory, as dsh-unified-memory does, so an auto-dream
-  // prune can never silently destroy another tool's memory.
+  // Deleting a memory that is not purely this plugin's (Claude Code's, dsh's, a hand-written one, or
+  // one of ours that another tool has since edited) first keeps a copy under the plugin's state
+  // directory, as dsh-unified-memory does, so an auto-dream prune can never silently destroy
+  // another tool's work.
   delete(fileName: string): DeleteMemoryResult {
     const { relativePath, filePath } = resolveMemoryFilePath(this.memoryDir, fileName)
     const existing = readTextFile(filePath)
     if (existing === null) return { deleted: false }
 
     let trashedTo: string | undefined
-    if (parseFrontmatter(existing).frontmatter.origin !== ORIGIN) {
+    if (!isPurelyOwn(existing, filePath)) {
       const stamp = this.now().toISOString().replace(/[:.]/g, "-")
       trashedTo = join(this.stateDir, "trash", stamp, relativePath)
       mkdirSync(dirname(trashedTo), { recursive: true })
@@ -209,6 +215,44 @@ export class MemoryStore {
       (parseMemoryType(frontmatter.type) ?? "user") === input.type &&
       body.replace(/\r\n/g, "\n") === input.content.trim().replace(/\r\n/g, "\n")
     return same && indexHasPointer(this.readIndex(), pointer)
+  }
+}
+
+// The frontmatter keys of a memory this plugin creates (buildFrontmatter), each on one line; its own
+// later saves keep exactly this set.
+const OWN_KEYS: readonly string[] = ["name", "description", "metadata", "type", "origin", "modified"]
+
+// How far a file's modification time may sit from this plugin's own `modified` stamp and still count
+// as that write: the stamp is taken just before the write, and filesystems with coarse timestamps
+// (FAT, HFS+) round the modification time down by up to 2 s.
+const OWN_WRITE_SLACK_MS = 2_000
+
+// A memory is purely this plugin's when its frontmatter is exactly what this plugin writes, with
+// `origin: opencode`, and the file has not changed since the plugin last wrote it. Other writers are
+// recognised by what they leave: Claude Code's Write and Edit tools keep `origin` but add `node_type`
+// and `originSessionId` and restamp `modified`, other tools add `updatedBy` or keys of their own
+// (or a second `modified`), and an edit that stamps nothing moves the modification time away from
+// our `modified`. Any doubt counts as "not ours": an unneeded copy in the trash is harmless, a
+// missing one loses another tool's work.
+function isPurelyOwn(content: string, filePath: string): boolean {
+  const keys = frontmatterKeys(content)
+  if (keys?.length !== OWN_KEYS.length || !OWN_KEYS.every((key) => keys.includes(key))) return false
+  const { frontmatter } = parseFrontmatter(content)
+  if (frontmatter.origin !== ORIGIN) return false
+  const stamped = Date.parse(frontmatter.modified ?? "")
+  if (Number.isNaN(stamped)) return false
+  try {
+    return Math.abs(statSync(filePath).mtimeMs - stamped) <= OWN_WRITE_SLACK_MS
+  } catch {
+    return false
+  }
+}
+
+function isLinkTo(path: string, other: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink() && realpathSync(path) === realpathSync(other)
+  } catch {
+    return false
   }
 }
 
