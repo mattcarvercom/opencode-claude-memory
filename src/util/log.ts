@@ -1,6 +1,8 @@
-import type { OpencodeClient } from "../sdk.js"
+import { appendFileSync, mkdirSync, statSync, truncateSync } from "node:fs"
+import { dirname } from "node:path"
 
 export const LOG_SERVICE = "opencode-claude-memory"
+export const MAX_LOG_BYTES = 512 * 1024
 
 export type LogLevel = "debug" | "info" | "warn" | "error"
 
@@ -15,19 +17,21 @@ export function getErrorMessage(error: unknown): string {
   return String(error)
 }
 
-// Logging goes through the OpenCode service log only. stderr is rendered into the chat UI, so a
-// failing background task must never write there. Every call is best-effort and never throws.
-export function createLogger(client: OpencodeClient | undefined, directory: string): Logger {
+// OpenCode 2 gives plugins no log channel and anything written to stderr lands in the chat UI, so
+// the plugin keeps its own JSON-lines log file next to its state. The file is truncated once it
+// passes MAX_LOG_BYTES. Every call is best-effort and never throws.
+export function createLogger(file: string | undefined): Logger {
   return (level, message, extra) => {
-    const log = client?.app?.log
-    if (typeof log !== "function") return
+    if (!file) return
     try {
-      void Promise.resolve(
-        log.call(client?.app, {
-          body: { service: LOG_SERVICE, level, message, extra },
-          query: { directory },
-        }),
-      ).catch(() => {})
+      mkdirSync(dirname(file), { recursive: true })
+      try {
+        if (statSync(file).size > MAX_LOG_BYTES) truncateSync(file, 0)
+      } catch {
+        // no file yet
+      }
+      const line = JSON.stringify({ time: new Date().toISOString(), service: LOG_SERVICE, level, message, ...extra })
+      appendFileSync(file, `${line}\n`)
     } catch {
       // best-effort
     }

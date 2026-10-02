@@ -1,10 +1,9 @@
 import { mkdirSync, mkdtempSync, rmSync, utimesSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { Hooks, PluginInput } from "@opencode-ai/plugin"
-import { createMemoryPlugin } from "../../src/index.js"
-import type { ChatMessage, OpencodeClient } from "../../src/sdk.js"
+import type { ContextMessage } from "../../src/sdk.js"
 import { MemoryStore } from "../../src/store/MemoryStore.js"
+import { makePlugin, selectionReply } from "../helpers/index.js"
 import type { EvalMessage, SeedMemory, TaskEvalCase } from "./fixtures.js"
 import type { TaskEvalJudge, TaskEvalJudgeResult } from "./judges.js"
 
@@ -23,19 +22,19 @@ function makeTempGitRepo(): string {
 
 let messageSeq = 0
 
-function materializeMessages(messages: EvalMessage[], sessionID: string): ChatMessage[] {
-  return messages.map((message) => {
-    messageSeq += 1
-    return {
-      info: {
+// Only user and assistant text reaches the V2 `context` hook as plain text parts; the fixtures'
+// system and tool parts have no counterpart there and are dropped.
+function materializeMessages(messages: EvalMessage[]): ContextMessage[] {
+  return messages
+    .filter((message) => message.role !== "system")
+    .map((message) => {
+      messageSeq += 1
+      return {
         id: `eval_${messageSeq}`,
         role: message.role,
-        sessionID: message.sessionID ?? sessionID,
-        time: { created: messageSeq },
-      },
-      parts: message.parts.map((part) => ({ ...part })),
-    } as unknown as ChatMessage
-  })
+        content: message.parts.filter((part) => part.type === "text").map((part) => ({ ...part })),
+      }
+    })
 }
 
 function memoryFileName(memory: SeedMemory): string {
@@ -56,39 +55,20 @@ function inferSelectorFilenames(taskCase: TaskEvalCase): string[] {
     .slice(0, 5)
 }
 
-function makeEvalSelectorClient(selectedMemories: readonly string[]): OpencodeClient {
-  let sessionCount = 0
-  return {
-    session: {
-      async create() {
-        sessionCount += 1
-        return { data: { id: `eval-selector-${sessionCount}` } }
-      },
-      async prompt() {
-        return { data: { info: { structured: { selected_memories: selectedMemories } }, parts: [] } }
-      },
-      async abort() {
-        return { data: true }
-      },
-      async delete() {
-        return { data: true }
-      },
-    },
-  } as unknown as OpencodeClient
-}
-
-async function makeHooks(worktree: string, claudeConfigDir: string, taskCase: TaskEvalCase): Promise<Hooks> {
-  const client = makeEvalSelectorClient(inferSelectorFilenames(taskCase))
-  return createMemoryPlugin({ CLAUDE_CONFIG_DIR: claudeConfigDir })(
-    { worktree, directory: worktree, client } as PluginInput,
-    { extract: { enabled: false }, autodream: { enabled: false } },
-  )
+async function makeHost(repo: string, claudeConfigDir: string, taskCase: TaskEvalCase) {
+  const host = await makePlugin({
+    directory: repo,
+    claudeConfigDir,
+    options: { extract: { enabled: false }, autodream: { enabled: false } },
+  })
+  host.setGenerate(() => selectionReply(...inferSelectorFilenames(taskCase)))
+  return host
 }
 
 // memory-on: the case messages as-is. memory-off: the same session first asked to ignore memory,
-// which is how a user turns memory off in v2 (session-scoped, no environment variable).
+// which is how a user turns memory off (session-scoped, no environment variable).
 async function renderSystemPrompt(
-  hooks: Hooks,
+  host: Awaited<ReturnType<typeof makeHost>>,
   messages: EvalMessage[],
   sessionID: string,
   ignoreMemory: boolean,
@@ -98,15 +78,11 @@ async function renderSystemPrompt(
     : []
   if (prelude.length > 0) {
     // Turn 1: the user switches memory off for the session.
-    await hooks["experimental.chat.messages.transform"]?.({}, { messages: materializeMessages(prelude, sessionID) })
+    await host.runContext(sessionID, materializeMessages(prelude))
   }
   // Turn 2 (or the only turn): the case conversation.
-  const output = { messages: materializeMessages([...prelude, ...messages], sessionID) }
-  await hooks["experimental.chat.messages.transform"]?.({}, output)
-
-  const system = { system: [] as string[] }
-  await hooks["experimental.chat.system.transform"]?.({ sessionID, model: {} as never }, system)
-  return system.system.join("\n\n")
+  const system = await host.runContext(sessionID, materializeMessages([...prelude, ...messages]))
+  return system.join("\n\n")
 }
 
 export async function runTaskEvalCase(taskCase: TaskEvalCase, judge: TaskEvalJudge): Promise<TaskEvalResult> {
@@ -129,9 +105,10 @@ export async function runTaskEvalCase(taskCase: TaskEvalCase, judge: TaskEvalJud
       }
     }
 
-    const hooks = await makeHooks(repo, claudeConfigDir, taskCase)
-    const onPrompt = await renderSystemPrompt(hooks, taskCase.messages, `${taskCase.id}:on`, false)
-    const offPrompt = await renderSystemPrompt(hooks, taskCase.messages, `${taskCase.id}:off`, true)
+    const host = await makeHost(repo, claudeConfigDir, taskCase)
+    const onPrompt = await renderSystemPrompt(host, taskCase.messages, `${taskCase.id}:on`, false)
+    const offPrompt = await renderSystemPrompt(host, taskCase.messages, `${taskCase.id}:off`, true)
+    host.cleanup()
     const judged = await judge({ taskCase, onPrompt, offPrompt })
 
     return {

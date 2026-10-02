@@ -2,7 +2,7 @@
   "name": "opencode-claude-memory",
   "version": "0.0.0-semantically-released",
   "type": "module",
-  "description": "OpenCode plugin for Claude Code memory: persistent, local-first shared memory with Claude Code-compatible Markdown files, LLM recall, in-process auto extraction, and auto-dream consolidation",
+  "description": "OpenCode 2 plugin for Claude Code memory: persistent, local-first shared memory with Claude Code-compatible Markdown files, LLM recall, in-process auto extraction, and auto-dream consolidation",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "exports": {
@@ -13,10 +13,11 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "index.js"
   ],
   "engines": {
-    "opencode": ">=1.18.0"
+    "opencode": ">=2.0.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -58,16 +59,16 @@
   ],
   "license": "MIT",
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.18.0"
+    "@opencode/plugin": ">=2.0.0"
   },
   "dependencies": {
     "zod": "^3.24.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^2",
-    "@opencode-ai/plugin": "^1.18.16",
     "bun-types": "^1.3.11",
     "conventional-changelog-conventionalcommits": "^9",
-    "typescript": "^6.0.2"
+    "typescript": "^6.0.2",
+    "@opencode/plugin": "^2.0.21"
   }
 }

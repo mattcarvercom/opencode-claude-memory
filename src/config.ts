@@ -6,23 +6,30 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647
 
 const timeoutMs = (fallback: number) => z.number().int().positive().max(MAX_TIMER_DELAY_MS).default(fallback)
 
-// Plugin options come from `opencode.json`: `"plugin": [["opencode-claude-memory", { ... }]]`.
+// "provider/model", the same spelling `opencode run --model` takes (the model id may itself contain
+// slashes, e.g. "openrouter/anthropic/claude-sonnet-5").
+const modelId = z.string().regex(/^[^/\s]+\/\S+$/, 'expected "provider/model"')
+
+// Plugin options come from `opencode.json`: `"plugins": [{ "package": "opencode-claude-memory", "options": { ... } }]`.
 // The schema is strict at every level so a misspelled key fails at plugin load instead of silently
-// falling back to defaults.
+// falling back to defaults. `model` is the model for the plugin's own background calls (recall,
+// extraction, auto-dream); each section can override it. Without either, OpenCode's default model is used.
 export const MemoryOptionsSchema = z
   .object({
+    model: modelId.optional(),
     extract: z
       .object({
+        model: modelId.optional(),
         enabled: z.boolean().default(true),
         timeoutMs: timeoutMs(120_000),
         debounceMs: z.number().int().nonnegative().max(MAX_TIMER_DELAY_MS).default(10_000),
         maxConversationChars: z.number().int().positive().default(60_000),
-        catchUpLimit: z.number().int().nonnegative().default(5),
       })
       .strict()
       .default({}),
     autodream: z
       .object({
+        model: modelId.optional(),
         enabled: z.boolean().default(true),
         minHours: z.number().positive().default(24),
         minSessions: z.number().int().positive().default(5),
@@ -32,6 +39,7 @@ export const MemoryOptionsSchema = z
       .default({}),
     recall: z
       .object({
+        model: modelId.optional(),
         enabled: z.boolean().default(true),
         waitMs: z.number().int().nonnegative().max(MAX_TIMER_DELAY_MS).default(1_500),
         timeoutMs: timeoutMs(30_000),
@@ -44,21 +52,8 @@ export const MemoryOptionsSchema = z
 
 export type MemoryOptions = z.infer<typeof MemoryOptionsSchema>
 
-// Agent names are fixed. Users customise the agents themselves (`agent.opencode-memory-extract.model`
-// in opencode.json) instead of pointing the plugin at a differently named agent.
-export const MEMORY_AGENTS = {
-  extract: "opencode-memory-extract",
-  recall: "opencode-memory-recall",
-  dream: "opencode-memory-dream",
-} as const
-
-export type MemoryAgents = typeof MEMORY_AGENTS
-
 export type MemoryConfig = MemoryOptions & {
   claudeConfigDir: string
-  // The user's home directory: where v1's shell hook would be installed (read-only detection).
-  homeDir: string
-  agents: MemoryAgents
 }
 
 export class MemoryConfigError extends Error {
@@ -89,15 +84,9 @@ export function parseMemoryOptions(options: unknown): MemoryOptions {
   return result.data
 }
 
-export function parseConfig(
-  options: unknown,
-  env: NodeJS.ProcessEnv = process.env,
-  homeDir: string = homedir(),
-): MemoryConfig {
+export function parseConfig(options: unknown, env: NodeJS.ProcessEnv = process.env): MemoryConfig {
   return {
     ...parseMemoryOptions(options),
     claudeConfigDir: resolveClaudeConfigDir(env),
-    homeDir,
-    agents: MEMORY_AGENTS,
   }
 }

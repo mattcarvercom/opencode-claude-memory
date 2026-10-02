@@ -1,29 +1,23 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { AUTO_MEMORY_MARKER } from "../../src/prompt/systemPrompt.js"
 import { RecallCoordinator, SESSION_STATE_TTL_MS } from "../../src/recall/RecallCoordinator.js"
-import type { ChatMessage } from "../../src/sdk.js"
-import { OwnedSessions } from "../../src/util/ownedSessions.js"
 import {
   cleanupTempDirs,
-  collectingLog,
+  contextMessage,
   deferred,
+  deps,
   makeConfig,
-  makeDeps,
-  makeSelectorClient,
+  makeGenerate,
   makeStore,
-  message,
-  methods,
+  type Reply,
   seedMemory,
-  selectorPromptText,
+  selectionReply,
   sleep,
-  textPart,
-  toolPart,
-  userMessage,
+  userContext,
 } from "../helpers/index.js"
 
 afterEach(cleanupTempDirs)
 
-function setup(options: { selections?: string[][]; waitMs?: number; enabled?: boolean } = {}) {
+function setup(options: { replies?: Reply | Reply[]; waitMs?: number; enabled?: boolean; now?: () => number } = {}) {
   const store = makeStore()
   seedMemory(store, {
     fileName: "testing_pref",
@@ -39,248 +33,180 @@ function setup(options: { selections?: string[][]; waitMs?: number; enabled?: bo
     type: "reference",
     content: "grep -r",
   })
-  const selector = makeSelectorClient(options.selections ?? [["testing_pref.md"]])
+  const model = makeGenerate(options.replies ?? selectionReply("testing_pref.md"))
   const config = makeConfig(
     { recall: { waitMs: options.waitMs ?? 1_500, enabled: options.enabled ?? true } },
     store.claudeConfigDir,
   )
-  const { log, entries } = collectingLog()
-  const owned = new OwnedSessions()
-  const recall = new RecallCoordinator(makeDeps({ store, config, client: selector.client, owned, log }))
-  return { store, recall, selector, owned, entries }
+  const recall = new RecallCoordinator(deps({ store, config, generate: model.generate, now: options.now }))
+  return { store, recall, model }
 }
 
+const names = (outcome: { recalled: Array<{ name: string }> }) => outcome.recalled.map((m) => m.name)
+
 describe("RecallCoordinator prefetch", () => {
-  test("first system.transform of a single-step turn receives the recalled memories", async () => {
-    const { recall, selector } = setup()
-    const output = { messages: [userMessage("How should we test database changes?", "ses_1", { id: "m1" })] }
-    recall.onMessagesTransform(output)
-
-    const recalled = await recall.takeRecalled("ses_1")
-    expect(recalled.map((m) => m.name)).toEqual(["Testing Preference"])
-    expect(recalled[0]?.content).toBe("Use real databases.")
-    expect(methods(selector.calls)).toEqual(["create", "prompt", "delete"])
-
-    // consumed exactly once
-    expect(await recall.takeRecalled("ses_1")).toEqual([])
+  test("the first call of a turn receives the recalled memories", async () => {
+    const { recall, model } = setup()
+    const outcome = await recall.onContext("ses_1", [userContext("How should we test database changes?", "m1")])
+    expect(outcome.ignored).toBe(false)
+    expect(names(outcome)).toEqual(["Testing Preference"])
+    expect(outcome.recalled[0]?.content).toBe("Use real databases.")
+    expect(model.calls).toHaveLength(1)
+    expect(model.calls[0]?.task).toBe("recall")
   })
 
-  test("a slow selector yields nothing on the first call and the result on the next call", async () => {
-    const { recall, selector } = setup({ waitMs: 30 })
-    const gate = deferred<unknown>()
-    selector.raw.session.prompt = async (options: unknown) => {
-      selector.calls.push({ method: "prompt", options })
-      await gate.promise
-      return { data: { info: { structured: { selected_memories: ["testing_pref.md"] } }, parts: [] } }
-    }
+  test("later calls of the same turn reuse the result without another model call", async () => {
+    const { recall, model } = setup()
+    const first = userContext("How should we test database changes?", "m1")
+    const a = await recall.onContext("ses_1", [first])
+    const b = await recall.onContext("ses_1", [first, contextMessage("assistant", "calling a tool")])
+    expect(names(b)).toEqual(names(a))
+    expect(model.calls).toHaveLength(1)
+  })
 
-    recall.onMessagesTransform({
-      messages: [userMessage("How should we test database changes?", "ses_2", { id: "m1" })],
-    })
-    expect(await recall.takeRecalled("ses_2")).toEqual([])
+  test("a new user message starts a new selection", async () => {
+    const { recall, model } = setup({ replies: [selectionReply("testing_pref.md"), selectionReply("grep_ref.md")] })
+    const first = userContext("How should we test database changes?", "m1")
+    expect(names(await recall.onContext("ses_4", [first]))).toEqual(["Testing Preference"])
+    expect(names(await recall.onContext("ses_4", [first, userContext("How do I use grep?", "m2")]))).toEqual([
+      "Grep Tool API",
+    ])
+    expect(model.calls).toHaveLength(2)
+  })
 
-    gate.resolve(undefined)
+  test("a slow selector yields nothing on the first call and the result on a later call", async () => {
+    const gate = deferred<string>()
+    const { recall, model } = setup({ waitMs: 30, replies: () => gate.promise })
+    const messages = [userContext("How should we test database changes?", "m1")]
+    expect((await recall.onContext("ses_2", messages)).recalled).toEqual([])
+
+    gate.resolve(selectionReply("testing_pref.md"))
     await sleep(5)
-    const second = await recall.takeRecalled("ses_2")
-    expect(second.map((m) => m.name)).toEqual(["Testing Preference"])
-    expect(await recall.takeRecalled("ses_2")).toEqual([])
+    expect(names(await recall.onContext("ses_2", messages))).toEqual(["Testing Preference"])
+    expect(model.calls).toHaveLength(1)
   })
 
-  test("waitMs = 0 keeps the v1 semantics: only an already settled prefetch is injected", async () => {
-    const { recall, selector } = setup({ waitMs: 0 })
-    const gate = deferred<unknown>()
-    selector.raw.session.prompt = async (options: unknown) => {
-      selector.calls.push({ method: "prompt", options })
-      await gate.promise
-      return { data: { info: { structured: { selected_memories: ["testing_pref.md"] } }, parts: [] } }
-    }
-    recall.onMessagesTransform({
-      messages: [userMessage("How should we test database changes?", "ses_3", { id: "m1" })],
-    })
-    expect(await recall.takeRecalled("ses_3")).toEqual([])
-    gate.resolve(undefined)
+  test("waitMs = 0 only injects an already settled selection", async () => {
+    const gate = deferred<string>()
+    const { recall } = setup({ waitMs: 0, replies: () => gate.promise })
+    const messages = [userContext("How should we test database changes?", "m1")]
+    expect((await recall.onContext("ses_3", messages)).recalled).toEqual([])
+    gate.resolve(selectionReply("testing_pref.md"))
     await sleep(5)
-    expect((await recall.takeRecalled("ses_3")).map((m) => m.name)).toEqual(["Testing Preference"])
+    expect(names(await recall.onContext("ses_3", messages))).toEqual(["Testing Preference"])
   })
 
-  test("reuses the prefetch across LLM calls of the same turn and restarts on a new turn", async () => {
-    const { recall, selector } = setup({ selections: [["testing_pref.md"], ["grep_ref.md"]] })
-    const first = userMessage("How should we test database changes?", "ses_4", { id: "m1" })
-    recall.onMessagesTransform({ messages: [first] })
-    recall.onMessagesTransform({ messages: [first, message("assistant", [toolPart("grep")], { sessionID: "ses_4" })] })
-    expect((await recall.takeRecalled("ses_4")).map((m) => m.name)).toEqual(["Testing Preference"])
-    expect(selector.calls.filter((c) => c.method === "prompt")).toHaveLength(1)
-
-    recall.onMessagesTransform({ messages: [first, userMessage("How do I use grep?", "ses_4", { id: "m2" })] })
-    expect((await recall.takeRecalled("ses_4")).map((m) => m.name)).toEqual(["Grep Tool API"])
-    expect(selector.calls.filter((c) => c.method === "prompt")).toHaveLength(2)
+  test("a failing or unparsable selector recalls nothing and never throws", async () => {
+    const failing = setup({ replies: new Error("model down") })
+    expect(
+      (await failing.recall.onContext("s", [userContext("How should we test database changes?", "m1")])).recalled,
+    ).toEqual([])
+    const garbage = setup({ replies: "no json" })
+    expect(
+      (await garbage.recall.onContext("s", [userContext("How should we test database changes?", "m1")])).recalled,
+    ).toEqual([])
   })
 
-  test("passes recent tools to the selector and filters already surfaced memories", async () => {
-    const { recall, selector } = setup({ selections: [["testing_pref.md", "grep_ref.md"]] })
-    const surfaced = `${AUTO_MEMORY_MARKER}\n# Auto Memory\n\n## Recalled Memories\n\n### Testing Preference (feedback)\nUse real databases.`
-    recall.onMessagesTransform({
-      messages: [
-        message("system", [textPart(surfaced)], { sessionID: "ses_5" }),
-        userMessage("Search the codebase", "ses_5", { id: "m1" }),
-        message("assistant", [toolPart("grep")], { sessionID: "ses_5" }),
-      ],
-    })
-    const recalled = await recall.takeRecalled("ses_5")
-    expect(recalled.map((m) => m.name)).toEqual(["Grep Tool API"])
-    const prompt = selectorPromptText(selector.calls.find((c) => c.method === "prompt")?.options)
-    expect(prompt).toContain("Recently used tools: grep")
-    expect(prompt).not.toContain("testing_pref.md")
-  })
-
-  test("does not start a selector for trivial queries or when recall is disabled", async () => {
+  test("does not call the model for trivial queries, an empty store or when recall is disabled", async () => {
     const trivial = setup()
-    trivial.recall.onMessagesTransform({ messages: [userMessage("hi", "ses_6", { id: "m1" })] })
-    expect(await trivial.recall.takeRecalled("ses_6")).toEqual([])
-    expect(trivial.selector.calls).toHaveLength(0)
+    expect((await trivial.recall.onContext("s", [userContext("hi", "m1")])).recalled).toEqual([])
+    expect(trivial.model.calls).toHaveLength(0)
 
     const cjk = setup()
-    cjk.recall.onMessagesTransform({ messages: [userMessage("数据库测试怎么做", "ses_7", { id: "m1" })] })
-    expect((await cjk.recall.takeRecalled("ses_7")).map((m) => m.name)).toEqual(["Testing Preference"])
+    expect(names(await cjk.recall.onContext("s", [userContext("数据库测试怎么做", "m1")]))).toEqual([
+      "Testing Preference",
+    ])
 
     const disabled = setup({ enabled: false })
-    disabled.recall.onMessagesTransform({
-      messages: [userMessage("How should we test database changes?", "ses_8", { id: "m1" })],
-    })
-    expect(await disabled.recall.takeRecalled("ses_8")).toEqual([])
-    expect(disabled.selector.calls).toHaveLength(0)
+    expect(
+      (await disabled.recall.onContext("s", [userContext("How should we test database changes?", "m1")])).recalled,
+    ).toEqual([])
+    expect(disabled.model.calls).toHaveLength(0)
+
+    const empty = makeStore()
+    const model = makeGenerate()
+    const recall = new RecallCoordinator(deps({ store: empty, generate: model.generate }))
+    await recall.onContext("s", [userContext("How should we test database changes?", "m1")])
+    expect(model.calls).toHaveLength(0)
   })
 
-  test("skips sessions owned by the plugin and warns once for a missing sessionID", async () => {
-    const { recall, selector, owned, entries } = setup()
-    owned.add("fork_1")
-    recall.onMessagesTransform({
-      messages: [userMessage("How should we test database changes?", "fork_1", { id: "m1" })],
-    })
-    expect(selector.calls).toHaveLength(0)
-
-    expect(await recall.takeRecalled(undefined)).toEqual([])
-    expect(await recall.takeRecalled(undefined)).toEqual([])
-    expect(entries.filter((e) => e.level === "warn")).toHaveLength(1)
+  test("without a generator nothing is recalled", async () => {
+    const recall = new RecallCoordinator(deps({ store: makeStore() }))
+    expect((await recall.onContext("s", [userContext("How should we test database changes?", "m1")])).recalled).toEqual(
+      [],
+    )
   })
 })
 
 describe("RecallCoordinator ignore-memory", () => {
   test("ignore persists for the session until the user asks for memory again", async () => {
-    const { recall, selector } = setup()
-    const messages: ChatMessage[] = [
-      message("system", [textPart(`${AUTO_MEMORY_MARKER}\n# Auto Memory`)], { sessionID: "ses_9" }),
-      userMessage("Ignore memory and answer from fresh context only.", "ses_9", { id: "m1" }),
-    ]
-    const output = { messages }
-    recall.onMessagesTransform(output)
-    expect(output.messages).toHaveLength(1)
+    const { recall, model } = setup()
+    const ignoring = userContext("Ignore memory and answer from fresh context only.", "m1")
+    const first = await recall.onContext("ses_9", [ignoring])
+    expect(first).toEqual({ ignored: true, recalled: [] })
     expect(recall.isIgnored("ses_9")).toBe(true)
-    expect(await recall.takeRecalled("ses_9")).toEqual([])
-    expect(selector.calls).toHaveLength(0)
+    expect(model.calls).toHaveLength(0)
 
-    recall.onMessagesTransform({
-      messages: [...messages, userMessage("How should we test database changes?", "ses_9", { id: "m2" })],
-    })
-    expect(recall.isIgnored("ses_9")).toBe(true)
-    expect(selector.calls).toHaveLength(0)
+    const next = await recall.onContext("ses_9", [ignoring, userContext("How should we test database changes?", "m2")])
+    expect(next.ignored).toBe(true)
+    expect(model.calls).toHaveLength(0)
 
-    recall.onMessagesTransform({
-      messages: [...messages, userMessage("ok, use memory again please", "ses_9", { id: "m3" })],
-    })
+    const resumed = await recall.onContext("ses_9", [ignoring, userContext("ok, use memory again please", "m3")])
+    expect(resumed.ignored).toBe(false)
     expect(recall.isIgnored("ses_9")).toBe(false)
-    expect((await recall.takeRecalled("ses_9")).map((m) => m.name)).toEqual(["Testing Preference"])
-  })
-
-  test("strips the plugin segment even without a sessionID", () => {
-    const { recall } = setup()
-    const output = {
-      messages: [
-        message("system", [textPart(`${AUTO_MEMORY_MARKER}\n# Auto Memory`)]),
-        userMessage("Ignore memory please."),
-      ],
-    }
-    recall.onMessagesTransform(output)
-    expect(output.messages).toHaveLength(1)
   })
 })
 
 describe("RecallCoordinator lifecycle", () => {
-  test("session.deleted drops the session state", () => {
+  test("session.deleted drops the session state", async () => {
     const { recall } = setup()
-    recall.onMessagesTransform({ messages: [userMessage("Ignore memory.", "ses_10", { id: "m1" })] })
+    await recall.onContext("ses_10", [userContext("Ignore memory.", "m1")])
     expect(recall.isIgnored("ses_10")).toBe(true)
-    recall.onEvent({ type: "session.deleted", properties: { info: { id: "ses_10" } } } as never)
+    recall.onSessionDeleted("ses_10")
     expect(recall.isIgnored("ses_10")).toBe(false)
     expect(recall.trackedSessions).toBe(0)
   })
 
-  test("stale turn caches are evicted after the TTL, but an ignored session keeps its instruction", () => {
+  test("stale turn caches are evicted after the TTL, but an ignored session keeps its instruction", async () => {
     let now = 1_000_000
-    const store = makeStore()
-    const recall = new RecallCoordinator(makeDeps({ store, now: () => now }))
-    recall.onMessagesTransform({ messages: [userMessage("hello there", "ses_plain", { id: "m1" })] })
-    recall.onMessagesTransform({ messages: [userMessage("Ignore memory.", "ses_ignored", { id: "m1" })] })
+    const { recall } = setup({ now: () => now })
+    await recall.onContext("ses_plain", [userContext("hello there", "m1")])
+    await recall.onContext("ses_ignored", [userContext("Ignore memory.", "m1")])
     expect(recall.trackedSessions).toBe(2)
     now += SESSION_STATE_TTL_MS + 1
-    recall.onMessagesTransform({ messages: [userMessage("hello there", "ses_new", { id: "m1" })] })
-    // the plain session's cache is gone; the ignored one is kept because the user asked for it
+    await recall.onContext("ses_new", [userContext("hello there", "m1")])
+    // the plain session is gone; the ignored one is kept because the user asked for it
     expect(recall.trackedSessions).toBe(2)
     expect(recall.isIgnored("ses_ignored")).toBe(true)
     expect(recall.isIgnored("ses_plain")).toBe(false)
   })
 
-  test("an ignore instruction keeps applying to the same session after the TTL without a resume", async () => {
+  test("an ignore instruction keeps applying after the TTL without a resume", async () => {
     let now = 1_000_000
-    const { recall } = setup()
-    const first = userMessage("Ignore memory for this session.", "ses_ttl", { id: "m1" })
-    const deps = new RecallCoordinator(makeDeps({ store: makeStore(), now: () => now }))
-    deps.onMessagesTransform({ messages: [first] })
-    expect(deps.isIgnored("ses_ttl")).toBe(true)
+    const { recall, model } = setup({ now: () => now })
+    const first = userContext("Ignore memory for this session.", "m1")
+    await recall.onContext("ses_ttl", [first])
     now += SESSION_STATE_TTL_MS + 1
-    deps.onMessagesTransform({
-      messages: [first, userMessage("Continue with the deployment work.", "ses_ttl", { id: "m2" })],
-    })
-    expect(deps.isIgnored("ses_ttl")).toBe(true)
-    expect(await deps.takeRecalled("ses_ttl")).toEqual([])
-    void recall
+    const outcome = await recall.onContext("ses_ttl", [first, userContext("Continue with the deployment work.", "m2")])
+    expect(outcome.ignored).toBe(true)
+    expect(model.calls).toHaveLength(0)
   })
 
-  test("a session first seen mid-conversation derives the ignore state from its history", () => {
+  test("a session first seen mid-conversation derives the ignore state from its history", async () => {
     const { recall } = setup()
     // e.g. after a process restart: the coordinator never saw the earlier "ignore memory" turn
-    recall.onMessagesTransform({
-      messages: [
-        userMessage("Please ignore memory from now on.", "ses_hist", { id: "m1" }),
-        userMessage("What did we decide about the database?", "ses_hist", { id: "m2" }),
-      ],
-    })
+    await recall.onContext("ses_hist", [
+      userContext("Please ignore memory from now on.", "m1"),
+      userContext("What did we decide about the database?", "m2"),
+    ])
     expect(recall.isIgnored("ses_hist")).toBe(true)
 
     const resumed = setup().recall
-    resumed.onMessagesTransform({
-      messages: [
-        userMessage("Please ignore memory from now on.", "ses_res", { id: "m1" }),
-        userMessage("OK, use memory again.", "ses_res", { id: "m2" }),
-        userMessage("What did we decide about the database?", "ses_res", { id: "m3" }),
-      ],
-    })
+    await resumed.onContext("ses_res", [
+      userContext("Please ignore memory from now on.", "m1"),
+      userContext("OK, use memory again.", "m2"),
+      userContext("What did we decide about the database?", "m3"),
+    ])
     expect(resumed.isIgnored("ses_res")).toBe(false)
-  })
-})
-
-describe("RecallCoordinator query eligibility", () => {
-  test("a CJK query without whitespace still triggers the selector prefetch", async () => {
-    const { recall, selector } = setup({ selections: [["testing_pref.md"]] })
-    recall.onMessagesTransform({ messages: [userMessage("数据库测试应该怎么做", "ses_cjk", { id: "m1" })] })
-    expect((await recall.takeRecalled("ses_cjk")).map((m) => m.name)).toEqual(["Testing Preference"])
-    expect(methods(selector.calls)).toContain("prompt")
-  })
-
-  test("a single short token does not start a selector fork", async () => {
-    const { recall, selector } = setup()
-    recall.onMessagesTransform({ messages: [userMessage("hi", "ses_short", { id: "m1" })] })
-    expect(await recall.takeRecalled("ses_short")).toEqual([])
-    expect(methods(selector.calls)).not.toContain("prompt")
   })
 })

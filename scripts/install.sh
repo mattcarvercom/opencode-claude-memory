@@ -5,9 +5,10 @@
 #
 # Run it from a checkout to build that checkout, or on its own to clone into
 # ~/.local/share/opencode-claude-memory (or --dir). Rerunning pulls and rebuilds.
-# The opencode config (global opencode.json or opencode.jsonc unless --config
-# is given) gets a file:// plugin entry for the checkout in place of any
-# opencode-claude-memory entry; plugin options on that entry are kept.
+# The OpenCode 2 config (global opencode.json or opencode.jsonc unless --config
+# is given) gets a file:// entry for the checkout in its "plugins" list in place
+# of any opencode-claude-memory entry, including one in the OpenCode 1 "plugin"
+# list; plugin options on that entry are kept.
 set -euo pipefail
 
 REPO_URL="https://github.com/mattcarvercom/opencode-claude-memory.git"
@@ -53,7 +54,7 @@ echo "Building"
 
 entry="file://$dir"
 if [ "$edit_config" -eq 0 ]; then
-    echo "Done. Add this to the \"plugin\" list in your opencode config: \"$entry\""
+    echo "Done. Add this to the \"plugins\" list in your opencode config: \"$entry\""
     exit 0
 fi
 
@@ -67,12 +68,19 @@ ENTRY="$entry" CONFIG="$config" bun -e '
 const fs = require("node:fs")
 const path = require("node:path")
 const { ENTRY: entry, CONFIG: file } = process.env
-const isOurs = (spec) => typeof spec === "string" && (spec === entry || /^opencode-claude-memory(@|$)/.test(spec))
-const nameOf = (item) => (Array.isArray(item) ? item[0] : item)
+// An entry is a string, the OpenCode 1 tuple ["name", options] or the OpenCode 2 object { package, options }.
+const specOf = (item) => (Array.isArray(item) ? item[0] : item && typeof item === "object" ? item.package : item)
+const optionsOf = (item) => (Array.isArray(item) ? item[1] : item && typeof item === "object" ? item.options : undefined)
+const isOurs = (item) => {
+  const spec = specOf(item)
+  return typeof spec === "string" && (spec === entry || /^(?:.*\/)?opencode-claude-memory(?:@[^\/]*)?\/?$/.test(spec))
+}
+const ours = (list) => (Array.isArray(list) ? list.filter(isOurs) : [])
+const make = (options) => (options ? { package: entry, options } : entry)
 
 if (!fs.existsSync(file)) {
   fs.mkdirSync(path.dirname(file), { recursive: true })
-  const config = { $schema: "https://opencode.ai/config.json", plugin: [entry] }
+  const config = { $schema: "https://opencode.ai/config.json", plugins: [entry] }
   fs.writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`)
   console.log(`Created ${file}`)
   process.exit(0)
@@ -80,9 +88,8 @@ if (!fs.existsSync(file)) {
 
 const text = fs.readFileSync(file, "utf8")
 const config = Bun.JSONC.parse(text)
-const plugins = Array.isArray(config.plugin) ? config.plugin : []
-const ours = plugins.filter((item) => isOurs(nameOf(item)))
-if (ours.length === 1 && nameOf(ours[0]) === entry) {
+const found = [...ours(config.plugins), ...ours(config.plugin)]
+if (found.length === 1 && specOf(found[0]) === entry && ours(config.plugins).length === 1) {
   console.log(`${file} already loads ${entry}`)
   process.exit(0)
 }
@@ -95,17 +102,21 @@ try {
 }
 
 if (strict) {
-  // Plain JSON: rewrite it, keeping options on an existing entry.
-  const kept = plugins.filter((item) => !isOurs(nameOf(item)))
-  const previous = ours.find(Array.isArray)
-  config.plugin = [...kept, previous ? [entry, ...previous.slice(1)] : entry]
+  // Plain JSON: rewrite it, moving our entry to "plugins" and keeping its options.
+  const options = found.map(optionsOf).find((o) => o !== undefined)
+  const others = (list) => (Array.isArray(list) ? list.filter((item) => !isOurs(item)) : [])
+  config.plugins = [...others(config.plugins), make(options)]
+  if (Array.isArray(config.plugin)) {
+    config.plugin = others(config.plugin)
+    if (config.plugin.length === 0) delete config.plugin
+  }
   fs.writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`)
   console.log(`Updated ${file}`)
   process.exit(0)
 }
 
 // JSONC with comments: change only the entry'"'"'s string, so comments survive.
-const names = [...new Set(ours.map(nameOf))]
+const names = [...new Set(found.map(specOf))]
 if (names.length === 1) {
   const literal = JSON.stringify(names[0])
   if (text.split(literal).length === 2) {
@@ -114,7 +125,7 @@ if (names.length === 1) {
     process.exit(0)
   }
 }
-console.log(`Could not edit ${file} safely (it has comments). Add "${entry}" to its "plugin" list, replacing any opencode-claude-memory entry.`)
+console.log(`Could not edit ${file} safely (it has comments). Add "${entry}" to its "plugins" list, replacing any opencode-claude-memory entry.`)
 process.exit(3)
 '
 

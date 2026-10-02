@@ -1,13 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import {
-  MEMORY_AGENTS,
-  MemoryConfigError,
-  MemoryOptionsSchema,
-  parseConfig,
-  resolveClaudeConfigDir,
-} from "../src/config.js"
+import { MemoryConfigError, MemoryOptionsSchema, parseConfig, resolveClaudeConfigDir } from "../src/config.js"
 
 describe("parseConfig", () => {
   test("applies defaults when no options are given", () => {
@@ -17,11 +11,10 @@ describe("parseConfig", () => {
       timeoutMs: 120_000,
       debounceMs: 10_000,
       maxConversationChars: 60_000,
-      catchUpLimit: 5,
     })
     expect(config.autodream).toEqual({ enabled: true, minHours: 24, minSessions: 5, timeoutMs: 300_000 })
     expect(config.recall).toEqual({ enabled: true, waitMs: 1_500, timeoutMs: 30_000, maxMemories: 5 })
-    expect(config.agents).toBe(MEMORY_AGENTS)
+    expect(config.model).toBeUndefined()
     expect(config.claudeConfigDir).toBe(join(homedir(), ".claude"))
   })
 
@@ -50,17 +43,30 @@ describe("parseConfig", () => {
     expect(() => parseConfig({ autodream: { minSessions: 0 } }, {})).toThrow(/autodream\.minSessions/)
   })
 
+  test("accepts a global model and per-section overrides in provider/model form", () => {
+    const config = parseConfig(
+      { model: "deepseek/deepseek-flash", recall: { model: "openrouter/anthropic/claude-haiku-4-5" } },
+      {},
+    )
+    expect(config.model).toBe("deepseek/deepseek-flash")
+    expect(config.recall.model).toBe("openrouter/anthropic/claude-haiku-4-5")
+    expect(config.extract.model).toBeUndefined()
+  })
+
+  test("rejects a model without a provider", () => {
+    expect(() => parseConfig({ model: "deepseek-flash" }, {})).toThrow(/model/)
+    expect(() => parseConfig({ extract: { model: "/x" } }, {})).toThrow(/extract\.model/)
+  })
+
+  test("rejects the removed catch-up option", () => {
+    expect(() => parseConfig({ extract: { catchUpLimit: 5 } }, {})).toThrow(/catchUpLimit/)
+  })
+
   test("only reads CLAUDE_CONFIG_DIR from the environment", () => {
-    const env = {
-      CLAUDE_CONFIG_DIR: "/tmp/claude-home",
-      OPENCODE_MEMORY_AGENT: "memory",
-      OPENCODE_MEMORY_RECALL_AGENT: "memory",
-      OPENCODE_MEMORY_EXTRACT: "0",
-    }
+    const env = { CLAUDE_CONFIG_DIR: "/tmp/claude-home", OPENCODE_MEMORY_EXTRACT: "0" }
     const config = parseConfig({}, env)
     expect(config.claudeConfigDir).toBe("/tmp/claude-home")
     expect(config.extract.enabled).toBe(true)
-    expect(config.agents.recall).toBe("opencode-memory-recall")
   })
 
   test("falls back to ~/.claude for a blank CLAUDE_CONFIG_DIR", () => {

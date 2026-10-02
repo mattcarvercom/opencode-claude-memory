@@ -1,9 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { readFileSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
 import {
   buildConversationForExtraction,
-  EXTRACTION_TITLE,
   ExtractionCoordinator,
   hasExtractableUserMessage,
   MAX_EXTRACTION_FAILURES,
@@ -13,54 +10,45 @@ import {
 import { MaintenanceLock } from "../../src/extraction/lock.js"
 import { EXTRACT_EXISTING_MEMORIES_HEADING } from "../../src/extraction/prompts.js"
 import { ExtractionStateStore } from "../../src/extraction/state.js"
-import type { ChatMessage } from "../../src/sdk.js"
-import { OwnedSessions } from "../../src/util/ownedSessions.js"
+import type { SessionMessage } from "../../src/sdk.js"
 import {
-  type ClientCall,
-  callOptions,
   cleanupTempDirs,
   collectingLog,
   deferred,
+  deps,
+  type GenerateCall,
   makeConfig,
-  makeDeps,
-  makeSelectorClient,
+  makeGenerate,
+  makeSessions,
   makeStore,
-  message,
-  methods,
+  memoriesReply,
+  type Reply,
   seedMemory,
-  tempDir,
+  sessionAssistant,
+  sessionUser,
   textPart,
   toolPart,
-  userMessage,
 } from "../helpers/index.js"
 
 afterEach(cleanupTempDirs)
 
-type Conversation = Record<string, ChatMessage[]>
+type Conversations = Record<string, SessionMessage[]>
 
-function setup(options: { conversations?: Conversation; sessions?: unknown[]; config?: Record<string, unknown> } = {}) {
+function setup(
+  options: { conversations?: Conversations; config?: Record<string, unknown>; replies?: Reply | Reply[] } = {},
+) {
   const store = makeStore()
   const config = makeConfig(
-    { extract: { debounceMs: 0, timeoutMs: 200, catchUpLimit: 2 }, autodream: { enabled: false }, ...options.config },
+    { extract: { debounceMs: 0, timeoutMs: 200 }, autodream: { enabled: false }, ...options.config },
     store.claudeConfigDir,
   )
-  const selector = makeSelectorClient()
-  const conversations: Conversation = options.conversations ?? {}
-  selector.raw.session.messages = async (opts) => {
-    selector.calls.push({ method: "messages", options: opts })
-    const id = (opts as { path: { id: string } }).path.id
-    return { data: conversations[id] ?? [] }
-  }
-  selector.raw.session.list = async (opts) => {
-    selector.calls.push({ method: "list", options: opts })
-    return { data: options.sessions ?? [] }
-  }
-  const owned = new OwnedSessions()
+  const model = makeGenerate(options.replies ?? '{"memories": []}')
+  const sessions = makeSessions(store.memoryRoot, options.conversations ?? {})
   const { log, entries } = collectingLog()
   let now = 1_000_000
   const state = new ExtractionStateStore(store.stateDir, () => now)
   const coordinator = new ExtractionCoordinator({
-    ...makeDeps({ store, config, client: selector.client, owned, log, now: () => now }),
+    ...deps({ store, config, generate: model.generate, sessions, log, now: () => now }),
     state,
     // Liveness probe injected so lock tests do not depend on which PIDs exist on the runner.
     lock: new MaintenanceLock(
@@ -70,187 +58,188 @@ function setup(options: { conversations?: Conversation; sessions?: unknown[]; co
       () => true,
     ),
   })
+  const conversations = sessions.messages
   const tick = (ms: number) => {
     now += ms
   }
-  return { store, config, selector, conversations, owned, entries, state, coordinator, tick, now: () => now }
+  return { store, config, model, sessions, conversations, entries, state, coordinator, tick, now: () => now }
 }
 
-function promptText(body: Record<string, unknown> | undefined): string {
-  const parts = (body?.parts ?? []) as Array<{ text?: string }>
-  return parts[0]?.text ?? ""
-}
-
-function promptCalls(calls: readonly ClientCall[]) {
-  return calls.filter((c) => c.method === "prompt").map((c) => (c.options as { body: Record<string, unknown> }).body)
-}
+const idleEvent = (sessionID: string) => ({ type: "session.idle", data: { sessionID } })
 
 async function idle(coordinator: ExtractionCoordinator, sessionID: string): Promise<void> {
-  coordinator.onEvent({ type: "session.idle", properties: { sessionID } } as never)
+  coordinator.onEvent(idleEvent(sessionID))
   await new Promise((resolve) => setTimeout(resolve, 5))
   await coordinator.idle()
 }
 
-const conversation = (sessionID: string, turns: number): ChatMessage[] => {
-  const out: ChatMessage[] = []
+const promptOf = (call: GenerateCall | undefined) => call?.prompt ?? ""
+
+// Two messages per turn with explicit ids and times: u<n> at n*10, a<n> completing at n*10+8.
+function turn(sessionID: string, n: number, userText: string, assistantText = `Noted, turn ${n}.`): SessionMessage[] {
+  return [
+    sessionUser(userText, n * 10, `${sessionID}_u${n}`),
+    sessionAssistant([textPart(assistantText)], { created: n * 10 + 5, id: `${sessionID}_a${n}` }),
+  ].map((m) => (m.type === "assistant" ? { ...m, time: { created: n * 10 + 5, completed: n * 10 + 8 } } : m))
+}
+
+const conversation = (sessionID: string, turns: number): SessionMessage[] => {
+  const out: SessionMessage[] = []
   for (let i = 1; i <= turns; i++) {
-    out.push(
-      userMessage(`I prefer PostgreSQL for everything, turn ${i}.`, sessionID, {
-        id: `${sessionID}_u${i}`,
-        time: { created: i * 10 },
-      }),
-    )
-    out.push(
-      message("assistant", [textPart(`Noted, turn ${i}.`), toolPart("grep", "completed", "match")], {
-        sessionID,
-        id: `${sessionID}_a${i}`,
-        time: { created: i * 10 + 5, completed: i * 10 + 8 },
-      }),
-    )
+    out.push(sessionUser(`I prefer PostgreSQL for everything, turn ${i}.`, i * 10, `${sessionID}_u${i}`))
+    out.push({
+      ...sessionAssistant([textPart(`Noted, turn ${i}.`), toolPart("grep", "match")], { id: `${sessionID}_a${i}` }),
+      time: { created: i * 10 + 5, completed: i * 10 + 8 },
+    })
   }
   return out
 }
 
 describe("ExtractionCoordinator incremental extraction", () => {
-  test("session.idle runs one extraction fork over the whole conversation and records the watermark", async () => {
-    const { coordinator, selector, conversations, state, store, owned } = setup()
+  test("session.idle runs one extraction over the whole conversation, saves the memories and records the watermark", async () => {
+    const reply = memoriesReply({ fileName: "feedback_postgres", type: "feedback", content: "Prefers PostgreSQL." })
+    const { coordinator, model, conversations, state, store } = setup({ replies: reply })
     seedMemory(store, { fileName: "existing", name: "Existing", description: "already known" })
-    conversations.ses_1 = conversation("ses_1", 2)
+    conversations.set("ses_1", conversation("ses_1", 2))
 
     await idle(coordinator, "ses_1")
 
-    expect(methods(selector.calls)).toEqual(["messages", "create", "prompt", "delete"])
-    const create = callOptions<{ body: Record<string, unknown> }>(selector.calls[1]).body
-    expect(create).toEqual({ parentID: "ses_1", title: EXTRACTION_TITLE })
-    const body = promptCalls(selector.calls)[0]
-    expect(body?.agent).toBe("opencode-memory-extract")
-    expect(body?.tools).toEqual({ "*": false, memory_save: true, memory_list: true, memory_read: true })
-    expect(String(body?.system)).toContain(EXTRACT_EXISTING_MEMORIES_HEADING)
-    expect(String(body?.system)).toContain("existing.md")
-    const text = ((body?.parts ?? []) as Array<{ text: string }>)[0]?.text ?? ""
-    expect(text).toContain("### User\nI prefer PostgreSQL for everything, turn 1.")
-    expect(text).toContain("### Assistant\nNoted, turn 2.")
-    expect(text).toContain("_[tool grep: match]_")
+    expect(model.calls).toHaveLength(1)
+    expect(model.calls[0]?.task).toBe("extract")
+    expect(model.calls[0]?.timeoutMs).toBe(200)
+    const prompt = promptOf(model.calls[0])
+    expect(prompt).toContain(EXTRACT_EXISTING_MEMORIES_HEADING)
+    expect(prompt).toContain("existing.md")
+    expect(prompt).toContain("### User\nI prefer PostgreSQL for everything, turn 1.")
+    expect(prompt).toContain("### Assistant\nNoted, turn 2.")
+    expect(prompt).toContain("_[tool grep: match]_")
 
+    expect(store.read("feedback_postgres")?.body).toBe("Prefers PostgreSQL.")
+    expect(store.readIndex()).toContain("feedback_postgres.md")
     expect(state.getSession("ses_1")).toMatchObject({ lastExtractedMessageID: "ses_1_a2", failures: 0 })
     expect(state.read().autodream.sessionsSince).toEqual(["ses_1"])
-    expect(owned.has("selector-session-1")).toBe(true)
   })
 
-  test("a second idle without new user messages does not start a fork; a new turn extracts only the delta", async () => {
-    const { coordinator, selector, conversations, state } = setup()
-    conversations.ses_2 = conversation("ses_2", 1)
+  test("a second idle without new user messages makes no call; a new turn extracts only the delta", async () => {
+    const { coordinator, model, conversations, state } = setup()
+    conversations.set("ses_2", conversation("ses_2", 1))
     await idle(coordinator, "ses_2")
-    expect(promptCalls(selector.calls)).toHaveLength(1)
+    expect(model.calls).toHaveLength(1)
 
     await idle(coordinator, "ses_2")
-    expect(promptCalls(selector.calls)).toHaveLength(1)
+    expect(model.calls).toHaveLength(1)
 
-    conversations.ses_2 = conversation("ses_2", 2)
+    conversations.set("ses_2", conversation("ses_2", 2))
     await idle(coordinator, "ses_2")
-    const bodies = promptCalls(selector.calls)
-    expect(bodies).toHaveLength(2)
-    const text = ((bodies[1]?.parts ?? []) as Array<{ text: string }>)[0]?.text ?? ""
-    expect(text).toContain("turn 2")
-    expect(text).not.toContain("turn 1")
+    expect(model.calls).toHaveLength(2)
+    expect(promptOf(model.calls[1])).toContain("turn 2")
+    expect(promptOf(model.calls[1])).not.toContain("turn 1")
     expect(state.getSession("ses_2")?.lastExtractedMessageID).toBe("ses_2_a2")
   })
 
-  test("a timed-out fork is aborted and deleted, the watermark stays and failures count up until the cap", async () => {
-    const { coordinator, selector, conversations, state, entries, now } = setup()
-    conversations.ses_3 = conversation("ses_3", 1)
-    const never = deferred<unknown>()
-    selector.raw.session.prompt = async (opts) => {
-      selector.calls.push({ method: "prompt", options: opts })
-      return never.promise
-    }
+  test("a failing call keeps the watermark and counts failures up to the cap, then moves on", async () => {
+    const { coordinator, model, conversations, state, entries, now } = setup({
+      replies: new Error("gateway unavailable"),
+    })
+    conversations.set("ses_3", conversation("ses_3", 1))
 
     for (let attempt = 1; attempt < MAX_EXTRACTION_FAILURES; attempt++) {
       await idle(coordinator, "ses_3")
       expect(state.getSession("ses_3")).toMatchObject({ updatedAt: 0, failures: attempt })
       expect(state.getSession("ses_3")?.attemptedAt).toBe(now())
     }
-    expect(methods(selector.calls).filter((m) => m === "abort")).toHaveLength(MAX_EXTRACTION_FAILURES - 1)
-    expect(methods(selector.calls).filter((m) => m === "delete")).toHaveLength(MAX_EXTRACTION_FAILURES - 1)
     expect(entries.filter((e) => e.level === "error")).toHaveLength(MAX_EXTRACTION_FAILURES - 1)
+    expect(entries[0]).toEqual({
+      level: "error",
+      message: "Memory extraction failed",
+      extra: { error: "gateway unavailable", sessionID: "ses_3", failures: 1 },
+    })
 
     await idle(coordinator, "ses_3")
     expect(state.getSession("ses_3")).toMatchObject({ lastExtractedMessageID: "ses_3_a1", failures: 0 })
+    expect(model.calls).toHaveLength(MAX_EXTRACTION_FAILURES)
   })
 
-  test("skips the LLM but advances the watermark when the main agent already saved memory", async () => {
-    const { coordinator, selector, conversations, state } = setup()
-    conversations.ses_4 = conversation("ses_4", 1)
-    expect(coordinator.recordSave("ses_4", "user_role.md")).toBeUndefined()
+  test("a reply that is not JSON counts as a failure, not as an empty extraction", async () => {
+    const { coordinator, conversations, state, entries } = setup({ replies: "I found nothing worth saving." })
+    conversations.set("ses_json", conversation("ses_json", 1))
+    await idle(coordinator, "ses_json")
+    expect(state.getSession("ses_json")).toMatchObject({ failures: 1 })
+    expect(entries[0]?.extra).toMatchObject({ error: "the model reply did not contain a JSON object" })
+  })
+
+  test("never overwrites an existing memory", async () => {
+    const reply = memoriesReply({ fileName: "existing", content: "clobbered" }, { fileName: "fresh" })
+    const { coordinator, conversations, store, entries } = setup({ replies: reply })
+    seedMemory(store, { fileName: "existing", content: "original" })
+    conversations.set("ses_o", conversation("ses_o", 1))
+    await idle(coordinator, "ses_o")
+    expect(store.read("existing")?.body).toBe("original")
+    expect(store.read("fresh")).not.toBeNull()
+    expect(entries.find((e) => e.message === "Memory extraction finished")?.extra).toMatchObject({
+      saved: ["fresh.md"],
+      skipped: ["existing"],
+    })
+  })
+
+  test("skips the model but advances the watermark when the main agent already saved memory", async () => {
+    const { coordinator, model, conversations, state } = setup()
+    conversations.set("ses_4", conversation("ses_4", 1))
+    coordinator.recordSave("ses_4")
 
     await idle(coordinator, "ses_4")
-    expect(methods(selector.calls)).toEqual(["messages"])
+    expect(model.calls).toHaveLength(0)
     expect(state.getSession("ses_4")?.lastExtractedMessageID).toBe("ses_4_a1")
     expect(state.read().autodream.sessionsSince).toEqual(["ses_4"])
 
-    conversations.ses_4 = conversation("ses_4", 2)
+    conversations.set("ses_4", conversation("ses_4", 2))
     await idle(coordinator, "ses_4")
-    expect(promptCalls(selector.calls)).toHaveLength(1)
+    expect(model.calls).toHaveLength(1)
   })
 
-  test("advances the watermark without a fork for trivial conversations", async () => {
-    const { coordinator, selector, conversations, state } = setup()
-    conversations.ses_5 = [userMessage("hi", "ses_5", { id: "ses_5_u1" })]
+  test("advances the watermark without a model call for trivial conversations", async () => {
+    const { coordinator, model, conversations, state } = setup()
+    conversations.set("ses_5", [sessionUser("hi", 1, "ses_5_u1")])
     await idle(coordinator, "ses_5")
-    expect(methods(selector.calls)).toEqual(["messages"])
+    expect(model.calls).toHaveLength(0)
     expect(state.getSession("ses_5")?.lastExtractedMessageID).toBe("ses_5_u1")
-  })
-
-  test("reports fork saves as the done-signal list and ignores plugin-owned sessions", async () => {
-    const { coordinator, selector, conversations, owned } = setup()
-    conversations.ses_6 = conversation("ses_6", 1)
-    let inFork: string[] | undefined
-    selector.raw.session.prompt = async (opts) => {
-      selector.calls.push({ method: "prompt", options: opts })
-      coordinator.recordSave("selector-session-1", "user_role.md")
-      inFork = coordinator.recordSave("selector-session-1", "feedback_db.md")
-      return { data: { info: {}, parts: [] } }
-    }
-    await idle(coordinator, "ses_6")
-    expect(inFork).toEqual(["user_role.md", "feedback_db.md"])
-    expect(coordinator.isOwnedSession("selector-session-1")).toBe(true)
-
-    owned.add("fork_x")
-    await idle(coordinator, "fork_x")
-    expect(promptCalls(selector.calls)).toHaveLength(1)
-    expect(coordinator.recordSave("fork_x", "x.md")).toBeUndefined()
-    expect(coordinator.recordSave(undefined, "x.md")).toBeUndefined()
   })
 
   test("does nothing when extraction is disabled or after dispose", async () => {
     const disabled = setup({ config: { extract: { enabled: false, debounceMs: 0 } } })
-    disabled.conversations.ses_7 = conversation("ses_7", 1)
+    disabled.conversations.set("ses_7", conversation("ses_7", 1))
     await idle(disabled.coordinator, "ses_7")
-    expect(disabled.selector.calls).toHaveLength(0)
+    expect(disabled.model.calls).toHaveLength(0)
 
     const live = setup()
-    live.conversations.ses_8 = conversation("ses_8", 1)
+    live.conversations.set("ses_8", conversation("ses_8", 1))
     live.coordinator.dispose()
     await idle(live.coordinator, "ses_8")
-    expect(live.selector.calls).toHaveLength(0)
+    expect(live.model.calls).toHaveLength(0)
+  })
+
+  test("does nothing without a model generator or session reader", async () => {
+    const store = makeStore()
+    const config = makeConfig({ extract: { debounceMs: 0 } }, store.claudeConfigDir)
+    const bare = new ExtractionCoordinator(deps({ store, config }))
+    expect(bare.enabled).toBe(false)
+    bare.onEvent(idleEvent("x"))
+    await bare.idle()
   })
 
   test("session.deleted cancels a pending debounce", async () => {
-    const { coordinator, selector, conversations } = setup({ config: { extract: { debounceMs: 20 } } })
-    conversations.ses_9 = conversation("ses_9", 1)
-    coordinator.onEvent({ type: "session.idle", properties: { sessionID: "ses_9" } } as never)
-    coordinator.onEvent({ type: "session.deleted", properties: { info: { id: "ses_9" } } } as never)
+    const { coordinator, model, conversations } = setup({ config: { extract: { debounceMs: 20 } } })
+    conversations.set("ses_9", conversation("ses_9", 1))
+    coordinator.onEvent(idleEvent("ses_9"))
+    coordinator.onEvent({ type: "session.deleted", data: { sessionID: "ses_9" } })
     await new Promise((resolve) => setTimeout(resolve, 40))
     await coordinator.idle()
-    expect(selector.calls).toHaveLength(0)
+    expect(model.calls).toHaveLength(0)
   })
 
-  test("extraction failures are logged through the service log, never stderr", async () => {
-    const { coordinator, selector, conversations, entries } = setup()
-    conversations.ses_10 = conversation("ses_10", 1)
-    selector.raw.session.prompt = async () => {
-      throw new Error("gateway unavailable")
-    }
+  test("failures are logged through the plugin log, never stderr", async () => {
+    const { coordinator, conversations } = setup({ replies: new Error("boom") })
+    conversations.set("ses_10", conversation("ses_10", 1))
     const originalError = console.error
     const stderr: unknown[] = []
     console.error = (...args: unknown[]) => void stderr.push(args)
@@ -260,29 +249,81 @@ describe("ExtractionCoordinator incremental extraction", () => {
       console.error = originalError
     }
     expect(stderr).toEqual([])
-    expect(entries).toContainEqual({
-      level: "error",
-      message: "Memory extraction failed",
-      extra: { error: "gateway unavailable", sessionID: "ses_10", failures: 1 },
-    })
+  })
+})
+
+describe("ExtractionCoordinator event routing", () => {
+  test("idle, succeeded, failed and interrupted executions all schedule an extraction", async () => {
+    for (const type of [
+      "session.idle",
+      "session.execution.succeeded",
+      "session.execution.failed",
+      "session.execution.interrupted",
+    ]) {
+      const { coordinator, model, conversations } = setup()
+      conversations.set("ses_e", conversation("ses_e", 1))
+      coordinator.onEvent({ type, data: { sessionID: "ses_e" } })
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      await coordinator.idle()
+      expect(model.calls).toHaveLength(1)
+    }
+  })
+
+  test("events without a session id and unrelated events are ignored", async () => {
+    const { coordinator, model } = setup()
+    coordinator.onEvent({ type: "session.idle" })
+    coordinator.onEvent({ type: "session.text.delta", data: { sessionID: "s" } })
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    await coordinator.idle()
+    expect(model.calls).toHaveLength(0)
+  })
+
+  test("only top-level sessions of this plugin's directory are extracted", async () => {
+    const { coordinator, model, conversations, sessions, store } = setup()
+    for (const id of ["foreign", "child", "mine", "unknown"]) conversations.set(id, conversation(id, 1))
+    sessions.infos.set("foreign", { id: "foreign", location: { directory: "/somewhere/else" } })
+    sessions.infos.set("child", { id: "child", parentID: "mine", location: { directory: store.memoryRoot } })
+    sessions.messages.delete("unknown")
+
+    for (const id of ["foreign", "child", "unknown"]) await idle(coordinator, id)
+    expect(model.calls).toHaveLength(0)
+    expect(sessions.contextCalls).toEqual([])
+
+    await idle(coordinator, "mine")
+    expect(model.calls).toHaveLength(1)
+  })
+
+  test("the ownership answer is cached per session", async () => {
+    const { coordinator, conversations, sessions } = setup()
+    conversations.set("ses_c", conversation("ses_c", 1))
+    let gets = 0
+    const get = sessions.get
+    sessions.get = async (id) => {
+      gets += 1
+      return get(id)
+    }
+    await idle(coordinator, "ses_c")
+    conversations.set("ses_c", conversation("ses_c", 2))
+    await idle(coordinator, "ses_c")
+    expect(gets).toBe(1)
   })
 })
 
 describe("ExtractionCoordinator cross-process lock (#30)", () => {
-  test("skips the fork and leaves the watermark alone while another live process holds the lock", async () => {
-    const { coordinator, selector, conversations, state, entries } = setup()
-    conversations.ses_lock = conversation("ses_lock", 1)
+  test("skips the call and leaves the watermark alone while another live process holds the lock", async () => {
+    const { coordinator, model, conversations, state, entries } = setup()
+    conversations.set("ses_lock", conversation("ses_lock", 1))
     const other = new MaintenanceLock(state.lockPath, Date.now, 99999, () => true)
     expect(other.tryAcquire()).toBe(true)
 
     await idle(coordinator, "ses_lock")
-    expect(methods(selector.calls)).toEqual(["messages"])
+    expect(model.calls).toHaveLength(0)
     expect(state.getSession("ses_lock")).toBeUndefined()
     expect(entries.some((e) => e.level === "info" && String(e.message).includes("maintenance lock"))).toBe(true)
 
     other.release()
     await idle(coordinator, "ses_lock")
-    expect(promptCalls(selector.calls)).toHaveLength(1)
+    expect(model.calls).toHaveLength(1)
     expect(state.getSession("ses_lock")?.lastExtractedMessageID).toBe("ses_lock_a1")
     // released after the run so the next process (or auto-dream) can take it
     expect(new MaintenanceLock(state.lockPath, Date.now, 4242, () => true).tryAcquire()).toBe(true)
@@ -290,7 +331,7 @@ describe("ExtractionCoordinator cross-process lock (#30)", () => {
 
   test("state updates are read from disk, so a change written by another process is not overwritten", async () => {
     const { coordinator, conversations, state } = setup()
-    conversations.ses_a = conversation("ses_a", 1)
+    conversations.set("ses_a", conversation("ses_a", 1))
     // Another process recorded its own session between our reads.
     new ExtractionStateStore(state.stateDir).update((data) => {
       data.sessions.other_process = { lastExtractedMessageID: "x", updatedAt: Date.now(), failures: 0 }
@@ -300,101 +341,53 @@ describe("ExtractionCoordinator cross-process lock (#30)", () => {
   })
 })
 
-describe("ExtractionCoordinator.catchUp", () => {
-  test("extracts sessions updated after their watermark, newest first, skipping children and respecting the limit", async () => {
-    const sessions = [
-      { id: "old", time: { updated: 50 } },
-      { id: "newest", time: { updated: 300 } },
-      { id: "child", parentID: "newest", time: { updated: 400 } },
-      { id: "middle", time: { updated: 200 } },
-      { id: "done", time: { updated: 100 } },
-    ]
-    const { coordinator, selector, conversations, state } = setup({ sessions })
-    for (const id of ["old", "newest", "middle", "done", "child"]) conversations[id] = conversation(id, 1)
-    state.update((data) => {
-      data.sessions.done = { lastExtractedMessageID: "done_a1", updatedAt: 150, failures: 0 }
-    })
-
-    await coordinator.catchUp()
-    await coordinator.idle()
-
-    const extracted = selector.calls
-      .filter((c) => c.method === "create")
-      .map((c) => (c.options as { body: { parentID: string } }).body.parentID)
-    expect(extracted).toEqual(["newest", "middle"])
-    expect(callOptions<{ query: Record<string, unknown> }>(selector.calls[0]).query).toEqual({
-      directory: coordinator ? expect.any(String) : "",
-    })
-
-    await coordinator.catchUp()
-    expect(selector.calls.filter((c) => c.method === "list")).toHaveLength(1)
-  })
-
-  test("logs and continues when the session list fails", async () => {
-    const { coordinator, selector, entries } = setup()
-    selector.raw.session.list = async () => {
-      throw new Error("offline")
-    }
-    await coordinator.catchUp()
-    expect(entries.some((e) => e.level === "warn" && String(e.message).includes("catch-up"))).toBe(true)
-  })
-})
-
 describe("pure helpers", () => {
   const msgs = conversation("s", 2)
 
   test("sliceNewMessages honours the watermark and falls back to timestamps", () => {
     expect(sliceNewMessages(msgs, undefined)).toHaveLength(4)
     expect(
-      sliceNewMessages(msgs, { lastExtractedMessageID: "s_a1", updatedAt: 0, failures: 0 }).map((m) => m.info.id),
+      sliceNewMessages(msgs, { lastExtractedMessageID: "s_a1", updatedAt: 0, failures: 0 }).map((m) => m.id),
     ).toEqual(["s_u2", "s_a2"])
     expect(sliceNewMessages(msgs, { lastExtractedMessageID: "s_a2", updatedAt: 0, failures: 0 })).toEqual([])
     expect(
-      sliceNewMessages(msgs, { lastExtractedMessageID: "deleted", updatedAt: 15, failures: 0 }).map((m) => m.info.id),
+      sliceNewMessages(msgs, { lastExtractedMessageID: "deleted", updatedAt: 15, failures: 0 }).map((m) => m.id),
     ).toEqual(["s_u2", "s_a2"])
   })
 
-  test("hasExtractableUserMessage ignores synthetic and empty text", () => {
-    expect(hasExtractableUserMessage([message("user", [textPart("real")])])).toBe(true)
-    expect(hasExtractableUserMessage([message("user", [textPart("auto", { synthetic: true })])])).toBe(false)
-    expect(hasExtractableUserMessage([message("user", [textPart("   ")]), message("assistant", [textPart("x")])])).toBe(
-      false,
-    )
+  test("hasExtractableUserMessage ignores empty text and non-user messages", () => {
+    expect(hasExtractableUserMessage([sessionUser("real")])).toBe(true)
+    expect(hasExtractableUserMessage([sessionUser("   "), sessionAssistant("x")])).toBe(false)
+    expect(hasExtractableUserMessage([{ id: "s", type: "synthetic", text: "auto" }])).toBe(false)
   })
 
-  test("buildConversationForExtraction keeps the tail when truncating", () => {
+  test("buildConversationForExtraction keeps the tail when truncating and skips unfinished tools", () => {
     const text = buildConversationForExtraction(msgs, 60)
     expect(text.startsWith("…[older turns truncated]")).toBe(true)
     expect(text.length).toBeLessThan(120)
-    expect(buildConversationForExtraction([message("user", [textPart("synthetic", { synthetic: true })])], 1000)).toBe(
-      "",
-    )
+    expect(buildConversationForExtraction([{ id: "s", type: "synthetic", text: "auto" }], 1000)).toBe("")
+    const running = sessionAssistant([toolPart("bash", "out", "running"), textPart("answer")])
+    expect(buildConversationForExtraction([running], 1000)).toBe("### Assistant\nanswer")
+  })
+
+  test("long tool output is cut to 300 characters", () => {
+    const long = sessionAssistant([toolPart("read", "x".repeat(500))])
+    const text = buildConversationForExtraction([long], 10_000)
+    expect(text).toContain(`${"x".repeat(300)}…`)
+    expect(text).not.toContain("x".repeat(301))
   })
 })
 
-// ─── regressions from the v2 review ──────────────────────────────────────────
-
-function turn(sessionID: string, n: number, userText: string, assistantText = `Noted, turn ${n}.`): ChatMessage[] {
-  return [
-    userMessage(userText, sessionID, { id: `${sessionID}_u${n}`, time: { created: n * 10 } }),
-    message("assistant", [textPart(assistantText)], {
-      sessionID,
-      id: `${sessionID}_a${n}`,
-      time: { created: n * 10 + 5, completed: n * 10 + 8 },
-    }),
-  ]
-}
-
 describe("ExtractionCoordinator watermark transactions (review F1)", () => {
   test("a snapshot taken before the lock never rolls the watermark back over another process's progress", async () => {
-    const { coordinator, selector, conversations, state } = setup()
-    conversations.ses_r = turn("ses_r", 1, "Remember PostgreSQL for this project.")
+    const { coordinator, model, conversations, sessions, state } = setup()
+    conversations.set("ses_r", turn("ses_r", 1, "Remember PostgreSQL for this project."))
 
-    // Between our messages() read and our lock acquisition, "another process" extracts through a2.
+    // Between our context read and our lock acquisition, "another process" extracts through a2.
     let injected = false
-    const messages = selector.raw.session.messages
-    selector.raw.session.messages = async (opts) => {
-      const result = await messages(opts)
+    const read = sessions.context
+    sessions.context = async (id) => {
+      const result = await read(id)
       if (!injected) {
         injected = true
         new ExtractionStateStore(state.stateDir).update((data) => {
@@ -410,17 +403,17 @@ describe("ExtractionCoordinator watermark transactions (review F1)", () => {
     }
 
     await idle(coordinator, "ses_r")
-    expect(promptCalls(selector.calls)).toHaveLength(0)
+    expect(model.calls).toHaveLength(0)
     expect(state.getSession("ses_r")?.lastExtractedMessageID).toBe("ses_r_a2")
   })
 
-  test("the main-agent short-circuit and the short-conversation path also respect a newer watermark", async () => {
+  test("the main-agent short-circuit also respects a newer watermark", async () => {
     const { coordinator, conversations, state } = setup()
-    conversations.ses_s = turn("ses_s", 1, "Remember PostgreSQL for this project.")
+    conversations.set("ses_s", turn("ses_s", 1, "Remember PostgreSQL for this project."))
     state.update((data) => {
       data.sessions.ses_s = { lastExtractedMessageID: "gone", lastMessageAt: 999, updatedAt: Date.now(), failures: 0 }
     })
-    coordinator.recordSave("ses_s", "x.md")
+    coordinator.recordSave("ses_s")
     await idle(coordinator, "ses_s")
     expect(state.getSession("ses_s")?.lastExtractedMessageID).toBe("gone")
   })
@@ -431,10 +424,8 @@ describe("ExtractionCoordinator watermark transactions (review F1)", () => {
       { extract: { debounceMs: 0, timeoutMs: 200 }, autodream: { enabled: false } },
       store.claudeConfigDir,
     )
-    const selector = makeSelectorClient()
-    const conversations: Conversation = { ses_c: turn("ses_c", 1, "Remember PostgreSQL for this project.") }
-    selector.raw.session.messages = async (opts) => ({
-      data: conversations[(opts as { path: { id: string } }).path.id] ?? [],
+    const sessions = makeSessions(store.memoryRoot, {
+      ses_c: turn("ses_c", 1, "Remember PostgreSQL for this project."),
     })
     const state = new ExtractionStateStore(store.stateDir)
     let watermarkAtRelease: string | undefined = "not-released"
@@ -445,7 +436,7 @@ describe("ExtractionCoordinator watermark transactions (review F1)", () => {
       }
     }
     const coordinator = new ExtractionCoordinator({
-      ...makeDeps({ store, config, client: selector.client }),
+      ...deps({ store, config, generate: makeGenerate('{"memories": []}').generate, sessions }),
       state,
       lock: new ObservingLock(state.lockPath, Date.now, 4242, () => true),
     })
@@ -453,165 +444,112 @@ describe("ExtractionCoordinator watermark transactions (review F1)", () => {
     expect(watermarkAtRelease).toBe("ses_c_a1")
     expect(state.getSession("ses_c")?.lastMessageAt).toBe(15)
   })
-})
 
-describe("ExtractionCoordinator catch-up boundary (review F3)", () => {
-  test("a turn that completed while the previous fork was running is caught up after a restart", async () => {
-    const { coordinator, selector, conversations, state, store, config, tick } = setup()
-    conversations.ses_f = turn("ses_f", 1, "Remember our PostgreSQL conventions.")
-    let sessionUpdated = 18
-    const prompt = selector.raw.session.prompt
-    selector.raw.session.prompt = async (opts) => {
-      // A new turn arrives (and finishes) while the fork is still running; the fork ends later.
-      conversations.ses_f = [...(conversations.ses_f ?? []), ...turn("ses_f", 2, "Deployments must wait until Friday.")]
-      sessionUpdated = 28
-      tick(5_000)
-      return prompt(opts)
-    }
-    await idle(coordinator, "ses_f")
+  test("a turn that completes while the model call runs is extracted on the next idle", async () => {
+    const gate = deferred<string>()
+    const { coordinator, model, conversations, state } = setup({ replies: () => gate.promise })
+    conversations.set("ses_f", turn("ses_f", 1, "Remember our PostgreSQL conventions."))
+    coordinator.onEvent(idleEvent("ses_f"))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    // A new turn arrives (and finishes) while the first call is still running.
+    conversations.set("ses_f", [
+      ...(conversations.get("ses_f") ?? []),
+      ...turn("ses_f", 2, "Deployments must wait until Friday."),
+    ])
+    gate.resolve('{"memories": []}')
+    await coordinator.idle()
     expect(state.getSession("ses_f")?.lastExtractedMessageID).toBe("ses_f_a1")
     expect(state.getSession("ses_f")?.lastMessageAt).toBe(15)
-    coordinator.dispose()
 
-    // Restart: the session's last update (28) is newer than the watermark message (15).
-    selector.raw.session.list = async () => ({ data: [{ id: "ses_f", time: { updated: sessionUpdated } }] })
-    selector.calls.length = 0
-    const fresh = new ExtractionCoordinator({
-      ...makeDeps({ store, config, client: selector.client }),
-      state,
-      lock: new MaintenanceLock(state.lockPath, Date.now, 4242, () => true),
-    })
-    await fresh.catchUp()
-    await fresh.idle()
-    const bodies = promptCalls(selector.calls)
-    expect(bodies).toHaveLength(1)
-    const text = promptText(bodies[0])
-    expect(text).toContain("Deployments must wait until Friday.")
-    expect(text).not.toContain("PostgreSQL conventions")
+    await idle(coordinator, "ses_f")
+    expect(model.calls).toHaveLength(2)
+    const second = promptOf(model.calls[1])
+    expect(second).toContain("Deployments must wait until Friday.")
+    expect(second).not.toContain("PostgreSQL conventions")
     expect(state.getSession("ses_f")?.lastExtractedMessageID).toBe("ses_f_a2")
   })
 
-  test("the fallback slice uses the watermark message time, not the fork's finish time", () => {
+  test("the fallback slice uses the watermark message time, not the extraction's finish time", () => {
     const messages = turn("ses_x", 2, "second")
     const state = { lastExtractedMessageID: "missing", lastMessageAt: 15, updatedAt: 99_999, failures: 0 }
-    expect(sliceNewMessages(messages, state).map((m) => m.info.id)).toEqual(["ses_x_u2", "ses_x_a2"])
+    expect(sliceNewMessages(messages, state).map((m) => m.id)).toEqual(["ses_x_u2", "ses_x_a2"])
   })
 })
 
 describe("ExtractionCoordinator busy sessions (review F4)", () => {
-  test("a busy status cancels the pending debounce; the next idle extracts both turns at once", async () => {
-    const { coordinator, selector, conversations, state, config } = setup()
+  test("a started execution cancels the pending debounce; the next idle extracts both turns at once", async () => {
+    const { coordinator, model, conversations, state, config } = setup()
     config.extract.debounceMs = 20
-    conversations.ses_b = turn("ses_b", 1, "Remember our PostgreSQL conventions.")
-    coordinator.onEvent({ type: "session.idle", properties: { sessionID: "ses_b" } } as never)
+    conversations.set("ses_b", turn("ses_b", 1, "Remember our PostgreSQL conventions."))
+    coordinator.onEvent(idleEvent("ses_b"))
     // New turn starts before the debounce fires: assistant still streaming (no `completed`).
-    conversations.ses_b = [
-      ...conversations.ses_b,
-      userMessage("Please diagnose the deployment failure.", "ses_b", { id: "ses_b_u2", time: { created: 20 } }),
-      message("assistant", [textPart("Still investigating...")], {
-        sessionID: "ses_b",
-        id: "ses_b_a2",
-        time: { created: 25 },
-      }),
-    ]
-    coordinator.onEvent({
-      type: "session.status",
-      properties: { sessionID: "ses_b", status: { type: "busy" } },
-    } as never)
+    conversations.set("ses_b", [
+      ...(conversations.get("ses_b") ?? []),
+      sessionUser("Please diagnose the deployment failure.", 20, "ses_b_u2"),
+      { ...sessionAssistant("Still investigating...", { id: "ses_b_a2" }), time: { created: 25 } },
+    ])
+    coordinator.onEvent({ type: "session.execution.started", data: { sessionID: "ses_b" } })
     await new Promise((resolve) => setTimeout(resolve, 40))
     await coordinator.idle()
-    expect(promptCalls(selector.calls)).toHaveLength(0)
+    expect(model.calls).toHaveLength(0)
     expect(state.getSession("ses_b")).toBeUndefined()
 
     // The answer completes and the session goes idle.
-    conversations.ses_b = [
-      ...conversations.ses_b.slice(0, 3),
-      message("assistant", [textPart("Final finding: the deploy must use port 8088.")], {
-        sessionID: "ses_b",
-        id: "ses_b_a2",
+    conversations.set("ses_b", [
+      ...(conversations.get("ses_b") ?? []).slice(0, 3),
+      {
+        ...sessionAssistant("Final finding: the deploy must use port 8088.", { id: "ses_b_a2" }),
         time: { created: 25, completed: 30 },
-      }),
-    ]
+      },
+    ])
     await idle(coordinator, "ses_b")
     await new Promise((resolve) => setTimeout(resolve, 30))
     await coordinator.idle()
-    const bodies = promptCalls(selector.calls)
-    expect(bodies).toHaveLength(1)
-    const text = promptText(bodies[0])
-    expect(text).toContain("PostgreSQL conventions")
-    expect(text).toContain("port 8088")
+    expect(model.calls).toHaveLength(1)
+    const prompt = promptOf(model.calls[0])
+    expect(prompt).toContain("PostgreSQL conventions")
+    expect(prompt).toContain("port 8088")
     expect(state.getSession("ses_b")?.lastExtractedMessageID).toBe("ses_b_a2")
   })
 
   test("an assistant message still being generated is never extracted or used as the watermark", async () => {
-    const { coordinator, selector, conversations, state } = setup()
-    conversations.ses_i = [
+    const { coordinator, model, conversations, state } = setup()
+    conversations.set("ses_i", [
       ...turn("ses_i", 1, "Remember our PostgreSQL conventions."),
-      userMessage("Now diagnose the failure.", "ses_i", { id: "ses_i_u2", time: { created: 20 } }),
-      message("assistant", [textPart("Partial answer so far")], {
-        sessionID: "ses_i",
-        id: "ses_i_a2",
-        time: { created: 25 },
-      }),
-    ]
+      sessionUser("Now diagnose the failure.", 20, "ses_i_u2"),
+      { ...sessionAssistant("Partial answer so far", { id: "ses_i_a2" }), time: { created: 25 } },
+    ])
     await idle(coordinator, "ses_i")
-    const text = promptText(promptCalls(selector.calls)[0])
-    expect(text).not.toContain("Partial answer so far")
+    expect(promptOf(model.calls[0])).not.toContain("Partial answer so far")
     expect(state.getSession("ses_i")?.lastExtractedMessageID).toBe("ses_i_u2")
   })
 
   test("trimIncompleteTail only drops the trailing streaming run", () => {
-    const done = message("assistant", [textPart("done")], { time: { created: 1, completed: 2 } })
-    const streaming = message("assistant", [textPart("...")], { time: { created: 3 } })
-    const user = userMessage("q", "s")
-    expect(trimIncompleteTail([user, done, streaming]).map((m) => m.info.id)).toEqual([user.info.id, done.info.id])
+    const done = { ...sessionAssistant("done"), time: { created: 1, completed: 2 } }
+    const streaming = { ...sessionAssistant("..."), time: { created: 3 } }
+    const user = sessionUser("q")
+    expect(trimIncompleteTail([user, done, streaming]).map((m) => m.id)).toEqual([user.id, done.id])
     expect(trimIncompleteTail([streaming, user])).toHaveLength(2)
     expect(trimIncompleteTail([])).toEqual([])
   })
 
   test("a job dequeued while its session is busy is skipped and retried on the next idle", async () => {
-    const { coordinator, selector, conversations } = setup()
-    conversations.ses_q = turn("ses_q", 1, "Remember our PostgreSQL conventions.")
-    coordinator.onEvent({ type: "session.idle", properties: { sessionID: "ses_q" } } as never)
-    coordinator.onEvent({
-      type: "session.status",
-      properties: { sessionID: "ses_q", status: { type: "retry" } },
-    } as never)
+    const { coordinator, model, conversations } = setup()
+    conversations.set("ses_q", turn("ses_q", 1, "Remember our PostgreSQL conventions."))
+    coordinator.onEvent(idleEvent("ses_q"))
+    coordinator.onEvent({ type: "session.execution.started", data: { sessionID: "ses_q" } })
     await new Promise((resolve) => setTimeout(resolve, 5))
     await coordinator.idle()
-    expect(promptCalls(selector.calls)).toHaveLength(0)
+    expect(model.calls).toHaveLength(0)
     await idle(coordinator, "ses_q")
-    expect(promptCalls(selector.calls)).toHaveLength(1)
+    expect(model.calls).toHaveLength(1)
   })
 })
 
-describe("ExtractionCoordinator v1 migration (review F11)", () => {
-  test("warns once on start-up when the v1 shell hook is still installed, without touching the file", async () => {
-    const store = makeStore()
-    const home = tempDir("ocm-home-")
-    const rc = join(home, ".zshrc")
-    const original = `export PATH=$PATH:/x\n# >>> opencode-memory auto-initialization >>>\nalias opencode=opencode-memory\n# <<< opencode-memory auto-initialization <<<\n`
-    writeFileSync(rc, original)
-    const config = makeConfig({ extract: { catchUpLimit: 0 } }, store.claudeConfigDir, home)
-    const selector = makeSelectorClient()
-    const { log, entries } = collectingLog()
-    const coordinator = new ExtractionCoordinator(makeDeps({ store, config, client: selector.client, log }))
-    await coordinator.catchUp()
-    await coordinator.catchUp()
-    const warnings = entries.filter(
-      (e) => e.level === "warn" && String(e.message).includes("v1 opencode-memory shell hook"),
-    )
-    expect(warnings).toHaveLength(1)
-    expect(warnings[0]?.extra).toEqual({ files: [rc] })
-    expect(readFileSync(rc, "utf-8")).toBe(original)
-  })
-
-  test("stays silent when no rc file carries the marker", async () => {
-    const store = makeStore()
-    const config = makeConfig({ extract: { catchUpLimit: 0 } }, store.claudeConfigDir)
-    const { log, entries } = collectingLog()
-    const coordinator = new ExtractionCoordinator(makeDeps({ store, config, client: makeSelectorClient().client, log }))
-    await coordinator.catchUp()
-    expect(entries.filter((e) => e.level === "warn")).toEqual([])
+describe("ExtractionCoordinator.start (v1 migration)", () => {
+  test("carries the v1 auto-dream timestamp over once", () => {
+    const { coordinator, state } = setup()
+    coordinator.start()
+    expect(state.read().autodream.lastConsolidatedAt).toBe(0)
   })
 })

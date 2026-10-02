@@ -1,35 +1,29 @@
-// Per-session recall state: which memories were already surfaced, whether the user asked to ignore
-// memory, and the in-flight selector prefetch for the current turn. One instance per plugin instance.
+// Per-session recall state: whether the user asked to ignore memory and the in-flight selector
+// prefetch for the current turn. One instance per plugin instance.
 //
-// Two kinds of state live here with different lifetimes: the turn cache (prefetch, turn id) is
-// evicted after SESSION_STATE_TTL_MS so a long-running `serve` does not leak; the user's
-// "ignore memory" instruction is a session preference and lasts until `session.deleted` or an
-// explicit resume. Eviction never clears it, and a session seen for the first time derives it
+// Two kinds of state live here with different lifetimes: the turn cache (prefetch, recalled
+// memories) is evicted after SESSION_STATE_TTL_MS so a long-running server does not leak; the
+// user's "ignore memory" instruction is a session preference and lasts until `session.deleted` or
+// an explicit resume. Eviction never clears it, and a session seen for the first time derives it
 // from the conversation history so a restart does not silently bring memory back.
-import type { AgentRegistry } from "../agents.js"
+//
+// The `context` hook runs before every model call. The first call of a turn starts the selector and
+// waits for it at most recall.waitMs; later calls of the same turn (tool loops) reuse the result, so
+// the recalled section stays identical across the turn and recall runs once per user message.
 import type { MemoryConfig } from "../config.js"
-import {
-  deriveIgnoredFromHistory,
-  detectIgnoreMemory,
-  detectResumeMemory,
-  stripAutoMemoryParts,
-} from "../hooks/ignore.js"
-import { buildTurnID, collectSurfacedMemoryKeys, extractRecentTools, getLastUserQuery } from "../hooks/messages.js"
-import type { ChatMessage, OpencodeClient, PluginEvent } from "../sdk.js"
+import { deriveIgnoredFromHistory, detectIgnoreMemory, detectResumeMemory } from "../hooks/ignore.js"
+import { buildTurnID, getLastUserQuery } from "../hooks/messages.js"
+import type { TaskGenerator } from "../llm.js"
+import type { ContextMessage } from "../sdk.js"
 import type { MemoryStore } from "../store/MemoryStore.js"
-import { surfaceKey } from "../store/scan.js"
-import type { Logger } from "../util/log.js"
-import type { OwnedSessions } from "../util/ownedSessions.js"
 import { type RecalledMemory, recallSelectedMemories } from "./format.js"
 import { selectRelevantMemoryFilenames } from "./selector.js"
 
 export const SESSION_STATE_TTL_MS = 60 * 60 * 1000
-export const SELECTOR_GRACE_MS = 60_000
 
 type Prefetch = {
-  turnID: string
   promise: Promise<RecalledMemory[]>
-  consumed: boolean
+  result?: RecalledMemory[]
 }
 
 type SessionState = {
@@ -42,12 +36,13 @@ type SessionState = {
 export type RecallCoordinatorDeps = {
   store: MemoryStore
   config: MemoryConfig
-  client: OpencodeClient | undefined
-  directory: string
-  owned: OwnedSessions
-  agents: AgentRegistry
-  log: Logger
+  generate: TaskGenerator | undefined
   now?: () => number
+}
+
+export type RecallOutcome = {
+  ignored: boolean
+  recalled: RecalledMemory[]
 }
 
 const TIMEOUT = Symbol("recall-timeout")
@@ -61,29 +56,19 @@ function isUsefulRecallQuery(query: string | undefined): query is string {
 
 export class RecallCoordinator {
   private readonly sessions = new Map<string, SessionState>()
-  private warnedMissingSessionID = false
   private readonly now: () => number
 
   constructor(private readonly deps: RecallCoordinatorDeps) {
     this.now = deps.now ?? Date.now
   }
 
-  // `experimental.chat.messages.transform`: derive the turn state and start the selector prefetch.
-  onMessagesTransform(output: { messages: ChatMessage[] }): void {
-    const turn = getLastUserQuery(output.messages)
-    const { sessionID } = turn
-    if (!sessionID) {
-      if (detectIgnoreMemory(turn.query)) output.messages = stripAutoMemoryParts(output.messages)
-      return
-    }
-    if (this.deps.owned.has(sessionID)) return
-
+  // `context` hook: derive the turn state, start the selector on a new turn and wait (bounded by
+  // recall.waitMs) for its result. On timeout the prefetch keeps running for the next model call.
+  async onContext(sessionID: string, messages: readonly ContextMessage[]): Promise<RecallOutcome> {
+    const turn = getLastUserQuery(messages)
     const now = this.now()
     this.evictStale(now)
-    const state = this.sessions.get(sessionID) ?? {
-      updatedAt: now,
-      ignored: deriveIgnoredFromHistory(output.messages),
-    }
+    const state = this.sessions.get(sessionID) ?? { updatedAt: now, ignored: deriveIgnoredFromHistory(messages) }
     state.updatedAt = now
 
     const turnID = buildTurnID(sessionID, turn)
@@ -91,39 +76,25 @@ export class RecallCoordinator {
       if (detectIgnoreMemory(turn.query)) state.ignored = true
       else if (state.ignored && detectResumeMemory(turn.query)) state.ignored = false
       state.turnID = turnID
-      state.prefetch = state.ignored ? undefined : this.startPrefetch(sessionID, turnID, turn.query, output.messages)
+      state.prefetch = state.ignored ? undefined : this.startPrefetch(turn.query)
     }
     this.sessions.set(sessionID, state)
 
-    if (state.ignored) output.messages = stripAutoMemoryParts(output.messages)
-  }
-
-  // `experimental.chat.system.transform`: wait for the prefetch (bounded by recall.waitMs) and hand
-  // the result over exactly once. On timeout the prefetch keeps running for the next LLM call.
-  async takeRecalled(sessionID: string | undefined): Promise<RecalledMemory[]> {
-    if (!sessionID) {
-      if (!this.warnedMissingSessionID) {
-        this.warnedMissingSessionID = true
-        this.deps.log("warn", "system.transform received no sessionID; memory recall is disabled for this call")
-      }
-      return []
-    }
-    const state = this.sessions.get(sessionID)
-    const prefetch = state?.prefetch
-    if (!state || state.ignored || !prefetch || prefetch.consumed) return []
+    if (state.ignored) return { ignored: true, recalled: [] }
+    const prefetch = state.prefetch
+    if (!prefetch) return { ignored: false, recalled: [] }
+    if (prefetch.result) return { ignored: false, recalled: prefetch.result }
 
     const result = await this.race(prefetch.promise, this.deps.config.recall.waitMs)
-    if (result === TIMEOUT) return []
-    prefetch.consumed = true
-    return result
+    return { ignored: false, recalled: result === TIMEOUT ? [] : result }
   }
 
   isIgnored(sessionID: string | undefined): boolean {
     return sessionID !== undefined && this.sessions.get(sessionID)?.ignored === true
   }
 
-  onEvent(event: PluginEvent): void {
-    if (event.type === "session.deleted") this.sessions.delete(event.properties.info.id)
+  onSessionDeleted(sessionID: string): void {
+    this.sessions.delete(sessionID)
   }
 
   get trackedSessions(): number {
@@ -155,39 +126,30 @@ export class RecallCoordinator {
     }
   }
 
-  private startPrefetch(
-    sessionID: string,
-    turnID: string,
-    query: string | undefined,
-    messages: readonly ChatMessage[],
-  ): Prefetch | undefined {
-    const { client, config, store, owned, agents, directory } = this.deps
-    if (!config.recall.enabled || !client || !isUsefulRecallQuery(query)) return undefined
+  private startPrefetch(query: string | undefined): Prefetch | undefined {
+    const { generate, config, store } = this.deps
+    if (!config.recall.enabled || !generate || !isUsefulRecallQuery(query)) return undefined
 
-    const alreadySurfaced = collectSurfacedMemoryKeys(messages)
-    const recentTools = extractRecentTools(messages)
-    const headers = store.scan().filter((header) => !alreadySurfaced.has(surfaceKey(header)))
+    const headers = store.scan()
     if (headers.length === 0) return undefined
 
-    const promise = selectRelevantMemoryFilenames({
-      client,
-      directory,
-      parentSessionID: sessionID,
-      query,
-      memories: headers,
-      recentTools,
-      agent: config.agents.recall,
-      tools: agents.toolsFor(config.agents.recall),
-      timeoutMs: config.recall.timeoutMs,
-      maxMemories: config.recall.maxMemories,
-      onSessionCreated: (id) => owned.add(id),
-      onSessionFinished: (id) => owned.release(id, SELECTOR_GRACE_MS),
-    })
-      .then((selected) =>
-        recallSelectedMemories(headers, selected, alreadySurfaced, { maxMemories: config.recall.maxMemories }),
-      )
-      .catch(() => [] as RecalledMemory[])
-
-    return { turnID, promise, consumed: false }
+    const prefetch: Prefetch = {
+      promise: selectRelevantMemoryFilenames({
+        generate,
+        query,
+        memories: headers,
+        timeoutMs: config.recall.timeoutMs,
+        maxMemories: config.recall.maxMemories,
+      })
+        .then((selected) =>
+          recallSelectedMemories(headers, selected, new Set(), { maxMemories: config.recall.maxMemories }),
+        )
+        .catch(() => [] as RecalledMemory[])
+        .then((recalled) => {
+          prefetch.result = recalled
+          return recalled
+        }),
+    }
+    return prefetch
   }
 }
